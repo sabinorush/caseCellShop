@@ -30,6 +30,26 @@
   background-color: #fdecea;
   color: #a02f24;
   border: 1px solid #f3c2bd;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.retryButton {
+  padding: 0.35rem 0.85rem;
+  border: 1px solid #a02f24;
+  border-radius: 6px;
+  background-color: transparent;
+  color: #a02f24;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.retryButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .grid {

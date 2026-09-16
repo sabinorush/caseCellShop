@@ -1,36 +1,52 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getProducts, ApiError } from './api/client';
 import type { CheckoutResult, Product } from './api/schemas';
 import { ProductCard } from './components/ProductCard';
 import styles from './App.module.css';
 
 type Banner = { type: 'success' | 'error'; message: string };
+type LoadError = { message: string; retryable: boolean };
 
 function App() {
   const [products, setProducts] = useState<Product[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<LoadError | null>(null);
+  const [isRetrying, setIsRetrying] = useState(false);
   const [banner, setBanner] = useState<Banner | null>(null);
+  const cancelledRef = useRef(false);
+
+  const loadProducts = useCallback(async () => {
+    try {
+      const data = await getProducts();
+      if (!cancelledRef.current) {
+        setProducts(data);
+        setLoadError(null);
+      }
+    } catch (error: unknown) {
+      if (cancelledRef.current) return;
+      setLoadError(
+        error instanceof ApiError
+          ? { message: error.message, retryable: error.retryable }
+          : { message: 'Não foi possível carregar os produtos.', retryable: true },
+      );
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-
-    getProducts()
-      .then((data) => {
-        if (!cancelled) setProducts(data);
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setLoadError(
-          error instanceof ApiError
-            ? error.message
-            : 'Não foi possível carregar os produtos.',
-        );
-      });
-
+    cancelledRef.current = false;
+    void loadProducts();
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
     };
-  }, []);
+  }, [loadProducts]);
+
+  async function handleRetry() {
+    setIsRetrying(true);
+    try {
+      await loadProducts();
+    } finally {
+      setIsRetrying(false);
+    }
+  }
 
   function handlePurchaseSuccess(result: CheckoutResult) {
     setProducts(
@@ -58,6 +74,7 @@ function App() {
 
       {banner && (
         <p
+          role="alert"
           className={`${styles.banner} ${
             banner.type === 'success' ? styles.bannerSuccess : styles.bannerError
           }`}
@@ -66,7 +83,21 @@ function App() {
         </p>
       )}
 
-      {loadError && <p className={styles.status}>{loadError}</p>}
+      {loadError && (
+        <p role="alert" className={`${styles.banner} ${styles.bannerError}`}>
+          <span>{loadError.message}</span>
+          {loadError.retryable && (
+            <button
+              type="button"
+              className={styles.retryButton}
+              onClick={handleRetry}
+              disabled={isRetrying}
+            >
+              {isRetrying ? 'Tentando…' : 'Tentar novamente'}
+            </button>
+          )}
+        </p>
+      )}
       {!products && !loadError && (
         <p className={styles.status}>Carregando produtos…</p>
       )}

@@ -8,9 +8,10 @@
     "build": "pnpm -r build",
     "build:api": "pnpm --filter @casecellshop/api build",
     "build:web": "pnpm --filter @casecellshop/web build",
-    "test": "pnpm --filter @casecellshop/api test",
+    "test": "pnpm -r test",
     "test:api": "pnpm --filter @casecellshop/api test",
     "test:api:e2e": "pnpm --filter @casecellshop/api test:e2e",
+    "test:web": "pnpm --filter @casecellshop/web test",
     "lint": "pnpm -r lint"
   }
 }
