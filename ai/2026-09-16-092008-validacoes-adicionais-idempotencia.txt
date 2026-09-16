@@ -1,0 +1,1501 @@
+ ▐▛███▛█   Claude Code v2.1.273
+▝▜██████▀  Opus 5 · Claude Pro
+  ▝▝ ▝▝    ~\projects\CaseCellShop
+
+
+> /clear                                                                        
+
+> preciso realizar tratativa de idempotencia no checkout a protecao apenas esta 
+  quando desabilitamos o botao de comprar no frontend, precisamos garantir que  
+  o checkout processe apenas uma requisicao. Nao queremos utilizar redis,       
+  vamos manter isso de forma simples se preciso armazenar em memoria a          
+  requisicao do cliente com um ID por tentativa de compra...                    
+                                                                                
+    Tambem vamos implementar healthcheck endpoint                               
+
+● I'll explore the codebase to understand the checkout flow and existing
+  structure.
+
+● Explore(Explore checkout flow)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Read 3 files, listed 2 directories (ctrl+o to expand)
+
+● That gives me strong context on the project's conventions. Let me wait for the
+  exploration results.
+
+  Read 10 files, listed 1 directory (ctrl+o to expand)
+
+● I have the core picture. Let me clarify the design decisions.
+
+● User answered Claude's questions:
+  ⎿  · Como o front deve enviar o ID da tentativa de compra para a API? → Header
+     Idempotency-Key (Recommended)
+     · O que a API deve responder quando chega uma requisição repetida com a 
+     mesma chave? → Replay + 409 se em voo (Recommended)
+     · Qual o ciclo de vida da chave no front (BuyForm)? → Por tentativa, 
+     reusada em falha (Recommended)
+     · Como implementar o healthcheck? → Controller próprio simples 
+     (Recommended)
+
+● Agent "Explore checkout flow" finished · 1m 35s
+
+● All four decisions are locked in and I have the full code picture. Writing the
+  plan.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: 
+     ~\.claude\plans\preciso-realizar-tratativa-de-validated-sunrise.md · /plan 
+     to edit
+     Idempotência no checkout + healthcheck
+
+     Context
+
+     Hoje a única proteção contra compra duplicada é o estado local isSubmitting
+     em
+     apps/web/src/components/BuyForm.tsx:26, que desabilita o botão "Comprar"
+     enquanto a
+     requisição está em voo. Isso é proteção de UI, não de servidor:
+
+     - apps/api/src/checkout/checkout.service.ts:28 gera um randomUUID() novo a
+       cada chamada e
+       apps/api/src/products/products.service.ts:30 decrementa o estoque — a API
+       não tem
+       nenhuma noção de "essa compra eu já processei".
+     - Qualquer caminho que escape do isSubmitting gera compra dupla: recarregar
+       a página e
+       clicar de novo, duas abas, curl, ou — o caso mais provável — um retry 
+       após
+       timeout/erro de rede. Depois do trabalho da sessão anterior, o client.ts
+       aborta em
+       8s (REQUEST_TIMEOUT_MS) e a UI incentiva o retry; se a API processou a
+       compra e só a
+       resposta se perdeu, o retry hoje debita o estoque duas vezes.
+
+     Objetivo: o servidor passa a ser a fonte da verdade da unicidade da compra.
+     Cada tentativa
+     carrega um Idempotency-Key; repetir a requisição com a mesma chave devolve
+     exatamente o
+     mesmo pedido, sem tocar no estoque. Sem Redis — um store em memória no
+     próprio processo,
+     no mesmo espírito do catálogo em memória que já existe.
+
+     Junto vai um GET /health simples, que hoje não existe (a única forma de
+     saber se a API
+     está de pé é bater em /products).
+
+     Decisões confirmadas: chave no header Idempotency-Key; duplicata concluída
+     → replay
+     do mesmo 201, duplicata em voo → 409; no front a chave é por tentativa e é
+     reusada em
+     falha incerta; healthcheck com controller próprio, sem @nestjs/terminus.
+
+     ---
+
+     1. API — store de idempotência
+
+     Novo: apps/api/src/common/idempotency-store.ts
+
+     Classe pura, sem decorators do Nest — igual ao InsufficientStockError, que
+     também mora
+     numa classe simples. Isso mantém os specs no padrão atual
+     (checkout.service.spec.ts
+     instancia new ProductsService() direto, sem TestingModule).
+
+     export type BeginResult<T> =
+       | { status: 'new' }
+       | { status: 'in-flight' }
+       | { status: 'replayed'; value: T }
+       | { status: 'fingerprint-mismatch' };
+
+     export class IdempotencyStore<T> {
+       constructor(options?: { ttlMs?: number; maxEntries?: number });
+       begin(key: string, fingerprint: string): BeginResult<T>;
+       complete(key: string, value: T): void;
+       release(key: string): void;
+     }
+
+     Entrada interna: { status: 'in-flight' | 'completed'; fingerprint: string; 
+     createdAt: number; value?: T }.
+
+     Regras:
+
+     - begin marca in-flight e devolve { status: 'new' } quando a chave não
+       existe.
+     - Chave existente com fingerprint diferente → fingerprint-mismatch (mesma
+       chave usada
+       para outro pedido: erro de cliente, não pode virar replay de um pedido
+       que não é aquele).
+     - Chave in-flight → in-flight. Chave completed → replayed com o valor
+       guardado.
+     - complete(key, value) grava o resultado; release(key) apaga a entrada.
+     - createdAt é gravado só no begin e nunca atualizado, então a ordem de
+       inserção do Map
+       continua monotônica em createdAt.
+
+     Contenção de memória, sem setInterval (evita segurar o event loop e vazar
+     entre testes):
+
+     - TTL padrão de 10 min. Varredura preguiçosa no início de cada begin: itera
+       o Map na
+       ordem de inserção e break no primeiro item não expirado.
+     - Teto padrão de 1000 entradas: ao inserir acima do teto, remove a mais
+       antiga (primeira
+       chave do Map). Sem isso um cliente malicioso enche a memória com chaves
+       aleatórias.
+
+     ttlMs/maxEntries pelo construtor existem para o spec exercitar expiração e
+     evicção sem
+     fake timers.
+
+     Novo: apps/api/src/common/idempotency-store.spec.ts — begin
+     novo/in-flight/replay;
+     mismatch de fingerprint; release libera a chave para um novo begin; entrada
+     expirada por
+     TTL vira new; passar do maxEntries descarta a mais antiga.
+
+     ---
+
+     2. API — checkout idempotente
+
+     apps/api/src/checkout/checkout.schema.ts — adicionar, ao lado do
+     checkoutSchema:
+
+     export const idempotencyKeySchema = z.uuid('Idempotency-Key deve ser um 
+     UUID');
+
+     (z.uuid() top-level é zod v4, mesmo estilo do z.url() já usado em
+     apps/web/vite.config.ts.) Exigir UUID, e não uma string qualquer, limita o
+     tamanho da
+     chave e casa com o crypto.randomUUID() do front.
+
+     apps/api/src/common/zod-validation.pipe.ts — o pipe hoje fixa
+     message: 'Dados inválidos'. Adicionar um segundo parâmetro opcional no
+     construtor
+     (constructor(schema: ZodType, message = 'Dados inválidos')) para que o erro
+     do header seja
+     'Idempotency-Key inválido'. Nenhuma chamada existente muda.
+
+     apps/api/src/checkout/checkout.controller.ts — trocar @UsePipes por pipes
+     por parâmetro. Isso não é cosmético: @UsePipes no método aplica o pipe a
+     todos os
+     parâmetros, então com o @Headers novo ele tentaria validar o header contra
+     o
+     checkoutSchema.
+
+     @Post()
+     purchase(
+       @Body(new ZodValidationPipe(checkoutSchema)) dto: CheckoutDto,
+       @Headers('idempotency-key', new ZodValidationPipe(idempotencyKeySchema,
+     'Idempotency-Key inválido'))
+       idempotencyKey: string,
+     ): CheckoutResult {
+       return this.checkoutService.purchase(dto, idempotencyKey);
+     }
+
+     Header ausente → o schema recebe undefined → 400. Chave passa a ser
+     obrigatória.
+     (req.headers do Express é minúsculo, então 'idempotency-key' casa com
+     qualquer
+     capitalização enviada pelo cliente.)
+
+     apps/api/src/checkout/checkout.service.ts — o corpo atual vira um
+     #execute(dto)
+     privado, intocado, e o purchase público ganha a camada de idempotência:
+
+     private readonly idempotency = new IdempotencyStore<CheckoutResult>();
+
+     purchase(dto: CheckoutDto, idempotencyKey: string): CheckoutResult {
+       const fingerprint = `${dto.productId}:${dto.quantity}`;
+       const begin = this.idempotency.begin(idempotencyKey, fingerprint);
+
+       if (begin.status === 'replayed') return begin.value;
+       if (begin.status === 'in-flight')
+         throw new ConflictException('Esta compra já está em processamento');
+       if (begin.status === 'fingerprint-mismatch')
+         throw new UnprocessableEntityException(
+           'Este Idempotency-Key já foi usado para outra compra',
+         );
+
+       try {
+         const result = this.execute(dto);
+         this.idempotency.complete(idempotencyKey, result);
+         return result;
+       } catch (error) {
+         this.idempotency.release(idempotencyKey);   // falha não "queima" a 
+     chave
+         throw error;
+       }
+     }
+
+     Duas escolhas que vale registrar:
+
+     - Falha libera a chave. Guardar o erro no store deixaria o cliente preso a
+       um 409 de
+       estoque que talvez já não seja verdade. Como o front gera chave nova
+       depois de um erro de
+       negócio (§4), na prática a entrada só some para não ocupar espaço.
+     - O in-flight hoje nunca é observável, porque purchase é 100% síncrono: o
+       begin/complete acontecem no mesmo tick, sem await no meio — a mesma
+       propriedade que já
+       torna o decremento de estoque atômico. O caminho existe para o dia em que
+       o checkout virar
+       assíncrono (gateway de pagamento) e continua correto desde já; o custo
+       são ~4 linhas.
+
+     UnprocessableEntityException (422) separa "chave reciclada para outro
+     pedido" do 409 de
+     estoque insuficiente — os dois já caem no mesmo tratamento genérico de 4xx
+     do
+     toHttpError em client.ts:66, então nada muda no front.
+
+     apps/api/src/checkout/checkout.service.spec.ts — casos novos, no padrão
+     pt-BR do
+     arquivo: mesma chave duas vezes → mesmo orderId e estoque cai uma vez;
+     chaves
+     diferentes → duas compras; mesma chave com quantity diferente → 422; compra
+     que falha por
+     estoque (409) libera a chave, e a mesma chave funciona numa nova tentativa
+     válida.
+
+     ---
+
+     3. API — GET /health
+
+     Novos: apps/api/src/health/health.controller.ts, health.module.ts,
+     health.controller.spec.ts — mesma estrutura de pasta de products/.
+
+     @Controller('health')
+     export class HealthController {
+       @Get()
+       check() {
+         return {
+           status: 'ok',
+           uptime: Number(process.uptime().toFixed(3)),
+           timestamp: new Date().toISOString(),
+         };
+       }
+     }
+
+     Sem serviço e sem estado — não há banco nem dependência externa para checar
+     (PRD, "fora de
+     escopo"). Registrar HealthModule em apps/api/src/app.module.ts. Como não há
+     prefixo
+     global, a rota é /health na API e /api/health através do proxy do Vite, que
+     já encaminha
+     tudo sob /api.
+
+     O spec instancia o controller direto e confere status: 'ok', uptime
+     numérico e
+     timestamp parseável.
+
+     ---
+
+     4. Web — chave por tentativa
+
+     Novo: apps/web/src/api/idempotency.ts — a regra de ciclo de vida da chave
+     como função
+     pura, para ser testável sem jsdom/Testing Library (o vitest.config.ts do
+     web é
+     environment: 'node' e não há infra de teste de componente):
+
+     export interface PurchaseAttempt { key: string; fingerprint: string }
+
+     export function checkoutFingerprint(productId: string, quantity: number):
+     string;
+
+     /** Reusa a chave da tentativa atual; gera outra se não houver ou se o 
+     pedido mudou. */
+     export function resolveAttempt(
+       current: PurchaseAttempt | null,
+       fingerprint: string,
+       newKey: () => string,
+     ): PurchaseAttempt;
+
+     O fingerprint do lado do cliente é o detalhe que evita o 422 na prática: se
+     o usuário toma
+     um erro de rede e então muda a quantidade antes de tentar de novo,
+     resolveAttempt vê
+     fingerprint diferente e emite chave nova, em vez de mandar a chave antiga
+     com outro payload.
+
+     apps/web/src/api/client.ts — postCheckout ganha um terceiro parâmetro:
+
+     export function postCheckout(
+       productId: string,
+       quantity: number,
+       idempotencyKey: string,
+     ): Promise<CheckoutResult> {
+       return request('/api/checkout', checkoutResultSchema, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json', 'Idempotency-Key':
+     idempotencyKey },
+         body: JSON.stringify({ productId, quantity }),
+       });
+     }
+
+     O helper request<T> e o tratamento de erro ficam intactos.
+
+     apps/web/src/components/BuyForm.tsx — a tentativa vira um
+     useRef<PurchaseAttempt | null>,
+     logo após a validação do Zod que já existe (linha 30-36):
+
+     - const attempt = resolveAttempt(attemptRef.current, 
+       checkoutFingerprint(productId, parsed.data), () => crypto.randomUUID()),
+       guardado no ref e enviado no postCheckout.
+     - Sucesso → attemptRef.current = null (próximo clique é uma tentativa
+       nova).
+     - Erro com error.retryable === false (400/404/409/422 — desfecho
+       definitivo) → também
+       zera o ref.
+     - Erro retryable (rede, timeout, 5xx — não se sabe se a API processou) →
+       mantém o ref, e
+       o próximo clique reenvia a mesma chave; se a compra tinha ido, a API
+       devolve o mesmo
+       201 e o estoque não cai de novo.
+
+     O isSubmitting continua exatamente como está — vira a primeira linha de
+     defesa, com o
+     servidor por trás. crypto.randomUUID() exige contexto seguro; localhost e
+     HTTPS contam,
+     então dev e prod estão cobertos.
+
+     ---
+
+     5. Testes
+
+     API — apps/api/test/app.e2e-spec.ts: os 5 casos de POST /checkout
+     existentes passam a
+     precisar de .set('Idempotency-Key', randomUUID()). Casos novos:
+
+     - sem o header → 400; header não-UUID → 400;
+     - mesma chave duas vezes → mesmo orderId, mesmo remainingStock, e GET 
+       /products confirma
+       que o estoque caiu uma vez só;
+     - chaves diferentes → duas compras, estoque cai duas vezes;
+     - GET /health → 200 com status: 'ok'.
+
+     Web — apps/web/src/api/client.test.ts (padrão vi.stubGlobal('fetch', ...) +
+     expectApiError já no arquivo): postCheckout envia o header Idempotency-Key
+     com o valor
+     recebido; 409 de duplicata vira ApiError não-retryable com a mensagem do
+     back.
+
+     Web — novo apps/web/src/api/idempotency.test.ts: sem tentativa corrente →
+     chave nova;
+     mesmo fingerprint → reusa a chave; fingerprint diferente → chave nova.
+
+     ---
+
+     Arquivos
+
+     Novos (API): src/common/idempotency-store.ts + .spec.ts,
+     src/health/health.controller.ts + .spec.ts, src/health/health.module.ts
+     Alterados (API): src/checkout/checkout.controller.ts, checkout.service.ts,
+     checkout.schema.ts, checkout.service.spec.ts,
+     src/common/zod-validation.pipe.ts,
+     src/app.module.ts, test/app.e2e-spec.ts
+
+     Novos (web): src/api/idempotency.ts + .test.ts
+     Alterados (web): src/api/client.ts, src/components/BuyForm.tsx,
+     src/api/client.test.ts
+
+     Fora de escopo (identificados, não incluídos): header de resposta
+     Idempotency-Replayed (o replay já é observável pelo orderId e pelo
+     estoque); rate
+     limiting / @nestjs/throttler; filtro de exceção global no Nest; persistir
+     os pedidos;
+     atualizar o PRD.md com a nova regra.
+
+     ---
+
+     Verificação
+
+     1. pnpm test:api e pnpm test:api:e2e — suítes existentes + as novas
+        passando.
+     2. pnpm test:web — client.test.ts e idempotency.test.ts passando.
+     3. pnpm build e pnpm lint limpos nos dois apps.
+     4. Com pnpm dev:api no ar, curl -i http://localhost:3000/health → 200 com
+        status: "ok".
+     5. Idempotência via curl, a prova central — mesma chave, duas vezes:
+     K=$(node -e "console.log(crypto.randomUUID())")
+     curl -s -X POST localhost:3000/checkout -H "Content-Type: application/json"
+     \
+       -H "Idempotency-Key: $K" -d '{"productId":"<id>","quantity":1}'
+     curl -s -X POST localhost:3000/checkout -H "Content-Type: application/json"
+     \
+       -H "Idempotency-Key: $K" -d '{"productId":"<id>","quantity":1}'
+        As duas respostas devem ter o mesmo orderId e o mesmo remainingStock;
+        conferir em
+        curl localhost:3000/products que o estoque caiu apenas 1.
+     6. Sem o header → 400. Mesma chave com quantity diferente → 422.
+     7. pnpm dev + navegador em http://localhost:5173: comprar 1 unidade
+        funciona e o card
+        atualiza como antes (regressão do fluxo feliz); comprar acima do estoque
+        continua no 409
+        com a mensagem do back.
+     8. Cenário de retry (o motivo da mudança): com a página carregada, derrubar
+        a API, clicar em
+        "Comprar" → banner de instabilidade. Subir a API e clicar de novo → na
+        aba Network as duas
+        requisições saem com o mesmo Idempotency-Key. Depois disso, mudar a
+        quantidade e
+        comprar → chave nova no header, compra normal.
+     9. Reiniciar a API e repetir o passo 5 com a chave antiga → 201 novo (o
+        store é em memória e
+        não sobrevive ao restart — comportamento esperado e aceito, sem Redis).
+
+  Read 2 files (ctrl+o to expand)
+
+● Now let's create the idempotency store:
+
+● Write(apps\api\src\common\idempotency-store.ts)
+  ⎿  Wrote 90 lines to apps\api\src\common\idempotency-store.ts
+       1 export type BeginResult<T> =
+       2   | { status: 'new' }
+       3   | { status: 'in-flight' }
+       4   | { status: 'replayed'; value: T }
+       5   | { status: 'fingerprint-mismatch' };
+       6 
+       7 interface Entry<T> {
+       8   status: 'in-flight' | 'completed';
+       9   fingerprint: string;
+      10   createdAt: number;
+     … +87 lines (ctrl+o to expand)
+
+● Write(apps\api\src\common\idempotency-store.spec.ts)
+  ⎿  Wrote 72 lines to apps\api\src\common\idempotency-store.spec.ts
+       1 import { describe, it, expect } from 'vitest';
+       2 import { IdempotencyStore } from './idempotency-store.js';
+       4 describe('IdempotencyStore', () => {
+       5   it('devolve "new" na primeira vez que uma chave é usada', () =
+         > {
+       7     expect(store.begin('key-1', 'fp-1')).toEqual({ status: 'new'
+          });
+       8   });
+      10   it('devolve "in-flight" enquanto a chave não foi completada', 
+         () => {
+     … +73 lines (ctrl+o to expand)
+
+● Update(apps\api\src\common\idempotency-store.spec.ts)
+  ⎿  Added 3 lines, removed 3 lines
+      61      const store = new IdempotencyStore<string>({ maxEntries: 2 
+          });
+      62      store.begin('key-1', 'fp-1');
+      63      store.begin('key-2', 'fp-2');
+      64 -    store.begin('key-3', 'fp-3');                              
+      64 +    store.begin('key-3', 'fp-3'); // teto ultrapassado: key-1 (
+         +a mais antiga) é descartada                                    
+      65  
+      66 -    // key-1 foi descartada por ser a mais antiga: volta a ser 
+         -"new".                                                         
+      67 -    expect(store.begin('key-1', 'fp-1')).toEqual({ status: 'new
+         -' });                                                          
+      66      // key-2 e key-3 continuam guardadas.
+      67      expect(store.begin('key-2', 'fp-2')).toEqual({ status: 'in-
+          flight' });
+      68      expect(store.begin('key-3', 'fp-3')).toEqual({ status: 'in-
+          flight' });
+      69 +    // key-1 foi descartada: volta a ser "new".                
+      70 +    expect(store.begin('key-1', 'fp-1')).toEqual({ status: 'new
+         +' });                                                          
+      71    });
+      72  });
+
+● Now update the zod-validation pipe to accept a custom message:
+
+● Update(apps\api\src\common\zod-validation.pipe.ts)
+  ⎿  Added 5 lines, removed 2 lines
+       3  
+       4  
+       5  export class ZodValidationPipe implements PipeTransform {
+       6 -  constructor(private readonly schema: ZodType) {}             
+       6 +  constructor(                                                 
+       7 +    private readonly schema: ZodType,                          
+       8 +    private readonly message = 'Dados inválidos',              
+       9 +  ) {}                                                         
+      10  
+      11    transform(value: unknown) {
+      12      const result = this.schema.safeParse(value);
+      13      if (!result.success) {
+      14        throw new BadRequestException({
+      12 -        message: 'Dados inválidos',                            
+      15 +        message: this.message,                                 
+      16          issues: result.error.issues.map((issue) => ({
+      17            path: issue.path.join('.'),
+      18            message: issue.message,
+
+● Now update the checkout schema to add the idempotency key schema:
+
+● Update(apps\api\src\checkout\checkout.schema.ts)
+  ⎿  Added 2 lines
+      10  });
+      11  
+      12  export type CheckoutDto = z.infer<typeof checkoutSchema>;
+      13 +                                                               
+      14 +export const idempotencyKeySchema = z.uuid('Idempotency-Key dev
+         +e ser um UUID');                                               
+
+  Read 1 file (ctrl+o to expand)
+
+● Let me add tests for the new idempotencyKeySchema here too:
+
+● Update(apps\api\src\checkout\checkout.schema.spec.ts)
+  ⎿  Added 1 line, removed 1 line
+      1  import { describe, it, expect } from 'vitest';
+      2 -import { checkoutSchema } from './checkout.schema.js';          
+      2 +import { checkoutSchema, idempotencyKeySchema } from './checkout
+        +.schema.js';                                                    
+      3  
+      4  describe('checkoutSchema', () => {
+      5    it('aceita um payload válido', () => {
+
+● Update(apps\api\src\checkout\checkout.schema.spec.ts)  ⎿  Added 17 lines
+      52      expect(result.success).toBe(false);
+      53    });
+      54  });
+      55 +                                                               
+      56 +describe('idempotencyKeySchema', () => {                       
+      57 +  it('aceita um UUID válido', () => {                          
+      58 +    const result = idempotencyKeySchema.safeParse('550e8400-e29
+         +b-41d4-a716-446655440000');                                    
+      59 +    expect(result.success).toBe(true);                         
+      60 +  });                                                          
+      61 +                                                               
+      62 +  it('rejeita uma string que não é UUID', () => {              
+      63 +    const result = idempotencyKeySchema.safeParse('minha-chave-
+         +qualquer');                                                    
+      64 +    expect(result.success).toBe(false);                        
+      65 +  });                                                          
+      66 +                                                               
+      67 +  it('rejeita valor ausente', () => {                          
+      68 +    const result = idempotencyKeySchema.safeParse(undefined);  
+      69 +    expect(result.success).toBe(false);                        
+      70 +  });                                                          
+      71 +});                                                            
+
+● Now update the checkout controller:
+
+● Write(apps\api\src\checkout\checkout.controller.ts)
+  ⎿  Added 11 lines, removed 5 lines
+      1 -import { Body, Controller, Post, UsePipes } from '@nestjs/common
+        -';                                                              
+      1 +import { Body, Controller, Headers, Post } from '@nestjs/common'
+        +;                                                               
+      2  import { CheckoutService } from './checkout.service.js';
+      3 -import { checkoutSchema, type CheckoutDto } from './checkout.sch
+        -ema.js';                                                        
+      3 +import { checkoutSchema, idempotencyKeySchema, type CheckoutDto 
+        +} from './checkout.schema.js';                                  
+      4  import { ZodValidationPipe } from '../common/zod-validation.pipe
+         .js';
+      5  import type { CheckoutResult } from './checkout-result.types.js'
+         ;
+      6  
+     ...
+       9    constructor(private readonly checkoutService: CheckoutService
+          ) {}
+      10  
+      11    @Post()
+      12 -  @UsePipes(new ZodValidationPipe(checkoutSchema))             
+      13 -  purchase(@Body() dto: CheckoutDto): CheckoutResult {         
+      14 -    return this.checkoutService.purchase(dto);                 
+      12 +  purchase(                                                    
+      13 +    @Body(new ZodValidationPipe(checkoutSchema)) dto: CheckoutD
+         +to,                                                            
+      14 +    @Headers(                                                  
+      15 +      'idempotency-key',                                       
+      16 +      new ZodValidationPipe(idempotencyKeySchema, 'Idempotency-
+         +Key inválido'),                                                
+      17 +    )                                                          
+      18 +    idempotencyKey: string,                                    
+      19 +  ): CheckoutResult {                                          
+      20 +    return this.checkoutService.purchase(dto, idempotencyKey); 
+      21    }
+      22  }
+
+● Now update the checkout service:
+
+● Write(apps\api\src\checkout\checkout.service.ts)
+  ⎿  Added 33 lines, removed 2 lines
+       1 -import { ConflictException, Injectable } from '@nestjs/common';
+       1 +import { ConflictException, Injectable, UnprocessableEntityExce
+         +ption } from '@nestjs/common';                                 
+       2  import { randomUUID } from 'node:crypto';
+       3  import {
+       4    InsufficientStockError,
+       5    ProductsService,
+       6  } from '../products/products.service.js';
+       7 +import { IdempotencyStore } from '../common/idempotency-store.j
+         +s';                                                            
+       8  import type { CheckoutDto } from './checkout.schema.js';
+       9  import type { CheckoutResult } from './checkout-result.types.js
+          ';
+      10  
+      11  @Injectable()
+      12  export class CheckoutService {
+      13 +  private readonly idempotency = new IdempotencyStore<CheckoutR
+         +esult>();                                                      
+      14 +                                                               
+      15    constructor(private readonly productsService: ProductsService
+          ) {}
+      16  
+      14 -  purchase(dto: CheckoutDto): CheckoutResult {                 
+      17 +  purchase(dto: CheckoutDto, idempotencyKey: string): CheckoutR
+         +esult {                                                        
+      18 +    const fingerprint = `${dto.productId}:${dto.quantity}`;    
+      19 +    const begin = this.idempotency.begin(idempotencyKey, finger
+         +print);                                                        
+      20 +                                                               
+      21 +    if (begin.status === 'replayed') {                         
+      22 +      return begin.value;                                      
+      23 +    }                                                          
+      24 +    if (begin.status === 'in-flight') {                        
+      25 +      throw new ConflictException('Esta compra já está em proce
+         +ssamento');                                                    
+      26 +    }                                                          
+      27 +    if (begin.status === 'fingerprint-mismatch') {             
+      28 +      throw new UnprocessableEntityException(                  
+      29 +        'Este Idempotency-Key já foi usado para outra compra', 
+      30 +      );                                                       
+      31 +    }                                                          
+      32 +                                                               
+      33 +    try {                                                      
+      34 +      const result = this.execute(dto);                        
+      35 +      this.idempotency.complete(idempotencyKey, result);       
+      36 +      return result;                                           
+      37 +    } catch (error) {                                          
+      38 +      // Falha não "queima" a chave: uma nova tentativa com a m
+         +esma chave deve                                                
+      39 +      // poder ser processada de novo (ex.: cliente corrige a q
+         +uantidade).                                                    
+      40 +      this.idempotency.release(idempotencyKey);                
+      41 +      throw error;                                             
+      42 +    }                                                          
+      43 +  }                                                            
+      44 +                                                               
+      45 +  private execute(dto: CheckoutDto): CheckoutResult {          
+      46      const product = this.productsService.findOne(dto.productId)
+          ;
+      47  
+      48      let updated;
+
+● Now update the existing checkout service spec to add the idempotency key param
+  and new test cases:
+
+● Write(apps\api\src\checkout\checkout.service.spec.ts)
+  ⎿  Added 84 lines, removed 16 lines
+       1  import { describe, it, expect, beforeEach } from 'vitest';
+       2 -import { ConflictException, NotFoundException } from '@nestjs/c
+         -ommon';                                                        
+       2 +import { randomUUID } from 'node:crypto';                      
+       3 +import {                                                       
+       4 +  ConflictException,                                           
+       5 +  NotFoundException,                                           
+       6 +  UnprocessableEntityException,                                
+       7 +} from '@nestjs/common';                                       
+       8  import { CheckoutService } from './checkout.service.js';
+       9  import { ProductsService } from '../products/products.service.j
+          s';
+      10  
+     ...
+      20    it('realiza uma compra válida e devolve o total correto', () 
+          => {
+      21      const product = productsService.findOne('case-iphone-15-sil
+          icone');
+      22  
+      18 -    const result = checkoutService.purchase({                  
+      19 -      productId: product.id,                                   
+      20 -      quantity: 2,                                             
+      21 -    });                                                        
+      23 +    const result = checkoutService.purchase(                   
+      24 +      { productId: product.id, quantity: 2 },                  
+      25 +      randomUUID(),                                            
+      26 +    );                                                         
+      27  
+      28      expect(result.orderId).toBeTruthy();
+      29      expect(result.productId).toBe(product.id);
+     ...
+      35  
+      36    it('reduz o estoque do produto após a compra (regra: só cai e
+          m compra bem-sucedida)', () => {
+      37      const before = productsService.findOne('case-iphone-15-sili
+          cone');
+      33 -    checkoutService.purchase({ productId: before.id, quantity: 
+         -1 });                                                          
+      38 +    checkoutService.purchase({ productId: before.id, quantity: 
+         +1 }, randomUUID());                                            
+      39      const after = productsService.findOne(before.id);
+      40      expect(after.stock).toBe(before.stock - 1);
+      41    });
+     ...
+      44      const before = productsService.findOne('case-galaxy-s24-car
+          teira'); // stock: 3
+      45  
+      46      expect(() =>
+      42 -      checkoutService.purchase({                               
+      43 -        productId: before.id,                                  
+      44 -        quantity: before.stock + 1,                            
+      45 -      }),                                                      
+      47 +      checkoutService.purchase(                                
+      48 +        { productId: before.id, quantity: before.stock + 1 },  
+      49 +        randomUUID(),                                          
+      50 +      ),                                                       
+      51      ).toThrow(ConflictException);
+      52  
+      53      const after = productsService.findOne(before.id);
+     ...
+       56  
+       57    it('lança 404 para produto inexistente', () => {
+       58      expect(() =>
+       54 -      checkoutService.purchase({ productId: 'inexistente', qua
+          -ntity: 1 }),                                                  
+       59 +      checkoutService.purchase({ productId: 'inexistente', qua
+          +ntity: 1 }, randomUUID()),                                    
+       60      ).toThrow(NotFoundException);
+       61    });
+       62  
+       63    it('permite comprar até esgotar o estoque, e a compra seguin
+           te falha', () => {
+       64      const product = productsService.findOne('case-galaxy-s24-c
+           arteira'); // stock: 3
+       65  
+       61 -    const result = checkoutService.purchase({                 
+       62 -      productId: product.id,                                  
+       63 -      quantity: product.stock,                                
+       64 -    });                                                       
+       66 +    const result = checkoutService.purchase(                  
+       67 +      { productId: product.id, quantity: product.stock },     
+       68 +      randomUUID(),                                           
+       69 +    );                                                        
+       70      expect(result.remainingStock).toBe(0);
+       71  
+       72      expect(() =>
+       68 -      checkoutService.purchase({ productId: product.id, quanti
+          -ty: 1 }),                                                     
+       73 +      checkoutService.purchase({ productId: product.id, quanti
+          +ty: 1 }, randomUUID()),                                       
+       74      ).toThrow(ConflictException);
+       75    });
+       76 +                                                              
+       77 +  describe('idempotência', () => {                            
+       78 +    it('repetir a mesma Idempotency-Key devolve o mesmo pedido
+          + e não decrementa o estoque de novo', () => {                 
+       79 +      const product = productsService.findOne('case-iphone-15-
+          +silicone');                                                   
+       80 +      const key = randomUUID();                               
+       81 +      const dto = { productId: product.id, quantity: 1 };     
+       82 +                                                              
+       83 +      const first = checkoutService.purchase(dto, key);       
+       84 +      const second = checkoutService.purchase(dto, key);      
+       85 +                                                              
+       86 +      expect(second.orderId).toBe(first.orderId);             
+       87 +      expect(second.remainingStock).toBe(first.remainingStock)
+          +;                                                             
+       88 +                                                              
+       89 +      const after = productsService.findOne(product.id);      
+       90 +      expect(after.stock).toBe(product.stock - 1);            
+       91 +    });                                                       
+       92 +                                                              
+       93 +    it('chaves diferentes geram compras independentes', () => 
+          +{                                                             
+       94 +      const product = productsService.findOne('case-iphone-15-
+          +silicone');                                                   
+       95 +      const dto = { productId: product.id, quantity: 1 };     
+       96 +                                                              
+       97 +      const first = checkoutService.purchase(dto, randomUUID()
+          +);                                                            
+       98 +      const second = checkoutService.purchase(dto, randomUUID(
+          +));                                                           
+       99 +                                                              
+      100 +      expect(second.orderId).not.toBe(first.orderId);         
+      101 +                                                              
+      102 +      const after = productsService.findOne(product.id);      
+      103 +      expect(after.stock).toBe(product.stock - 2);            
+      104 +    });                                                       
+      105 +                                                              
+      106 +    it('reusar a chave com um pedido diferente lança 422 e não
+          + altera o estoque', () => {                                   
+      107 +      const product = productsService.findOne('case-iphone-15-
+          +silicone');                                                   
+      108 +      const key = randomUUID();                               
+      109 +                                                              
+      110 +      checkoutService.purchase({ productId: product.id, quanti
+          +ty: 1 }, key);                                                
+      111 +      const stockAfterFirst = productsService.findOne(product.
+          +id).stock;                                                    
+      112 +                                                              
+      113 +      expect(() =>                                            
+      114 +        checkoutService.purchase({ productId: product.id, quan
+          +tity: 2 }, key),                                              
+      115 +      ).toThrow(UnprocessableEntityException);                
+      116 +                                                              
+      117 +      expect(productsService.findOne(product.id).stock).toBe(s
+          +tockAfterFirst);                                              
+      118 +    });                                                       
+      119 +                                                              
+      120 +    it('uma compra que falha por estoque insuficiente libera a
+          + chave para uma nova tentativa', () => {                      
+      121 +      const product = productsService.findOne('case-galaxy-s24
+          +-carteira'); // stock: 3                                      
+      122 +      const key = randomUUID();                               
+      123 +                                                              
+      124 +      expect(() =>                                            
+      125 +        checkoutService.purchase(                             
+      126 +          { productId: product.id, quantity: product.stock + 1
+          + },                                                           
+      127 +          key,                                                
+      128 +        ),                                                    
+      129 +      ).toThrow(ConflictException);                           
+      130 +                                                              
+      131 +      const result = checkoutService.purchase(                
+      132 +        { productId: product.id, quantity: 1 },               
+      133 +        key,                                                  
+      134 +      );                                                      
+      135 +                                                              
+      136 +      expect(result.remainingStock).toBe(product.stock - 1);  
+      137 +    });                                                       
+      138 +  });                                                         
+      139  });
+
+● Now let's create the health module. First let's check the products module for
+  the pattern:
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(apps\api\src\health\health.controller.ts)
+  ⎿  Wrote 19 lines to apps\api\src\health\health.controller.ts
+       1 import { Controller, Get } from '@nestjs/common';
+       2 
+       3 export interface HealthStatus {
+       4   status: 'ok';
+       5   uptime: number;
+       6   timestamp: string;
+       7 }
+       8 
+       9 @Controller('health')
+      10 export class HealthController {
+     … +9 lines (ctrl+o to expand)
+
+● Write(apps\api\src\health\health.module.ts)
+  ⎿  Wrote 7 lines to apps\api\src\health\health.module.ts
+      1 import { Module } from '@nestjs/common';
+      2 import { HealthController } from './health.controller.js';
+      3 
+      4 @Module({
+      5   controllers: [HealthController],
+      6 })
+      7 export class HealthModule {}
+
+● Write(apps\api\src\health\health.controller.spec.ts)
+  ⎿  Wrote 15 lines to apps\api\src\health\health.controller.spec.ts
+       1 import { describe, it, expect } from 'vitest';
+       2 import { HealthController } from './health.controller.js';
+       3 
+       4 describe('HealthController', () => {
+       5   it('devolve status ok com uptime e timestamp válidos', () => {
+       6     const controller = new HealthController();
+       7 
+       8     const result = controller.check();
+       9 
+      10     expect(result.status).toBe('ok');
+     … +6 lines (ctrl+o to expand)
+
+● Now register the HealthModule in app.module.ts:
+
+● Update(apps\api\src\app.module.ts)
+  ⎿  Added 2 lines, removed 1 line
+      1  import { Module } from '@nestjs/common';
+      2  import { ProductsModule } from './products/products.module.js';
+      3  import { CheckoutModule } from './checkout/checkout.module.js';
+      4 +import { HealthModule } from './health/health.module.js';       
+      5  
+      6  @Module({
+      6 -  imports: [ProductsModule, CheckoutModule],                    
+      7 +  imports: [ProductsModule, CheckoutModule, HealthModule],      
+      8  })
+      9  export class AppModule {}
+
+● Now update the e2e spec to add the header to existing checkout tests and add
+  new test cases:
+
+● Write(apps\api\test\app.e2e-spec.ts)
+  ⎿  Added 103 lines
+      1  import { describe, it, expect, beforeEach, afterEach } from 'vit
+         est';
+      2 +import { randomUUID } from 'node:crypto';                       
+      3  import { Test, TestingModule } from '@nestjs/testing';
+      4  import { INestApplication } from '@nestjs/common';
+      5  import request from 'supertest';
+     ...
+      33      expect(response.body[0]).toHaveProperty('stock');
+      34    });
+      35  
+      36 +  it('GET /health devolve status ok', async () => {            
+      37 +    const response = await request(app.getHttpServer())        
+      38 +      .get('/health')                                          
+      39 +      .expect(200);                                            
+      40 +                                                               
+      41 +    expect(response.body.status).toBe('ok');                   
+      42 +    expect(typeof response.body.uptime).toBe('number');        
+      43 +  });                                                          
+      44 +                                                               
+      45    it('POST /checkout com payload válido devolve 201', async () 
+          => {
+      46      const products = await request(app.getHttpServer()).get('/p
+          roducts');
+      47      const product = products.body[0];
+      48  
+      49      const response = await request(app.getHttpServer())
+      50        .post('/checkout')
+      51 +      .set('Idempotency-Key', randomUUID())                    
+      52        .send({ productId: product.id, quantity: 1 })
+      53        .expect(201);
+      54  
+     ...
+      59    it('POST /checkout com payload inválido devolve 400', async (
+          ) => {
+      60      await request(app.getHttpServer())
+      61        .post('/checkout')
+      62 +      .set('Idempotency-Key', randomUUID())                    
+      63        .send({ quantity: 0 })
+      64        .expect(400);
+      65    });
+     ...
+      70  
+      71      await request(app.getHttpServer())
+      72        .post('/checkout')
+      73 +      .set('Idempotency-Key', randomUUID())                    
+      74        .send({ productId: outOfStock.id, quantity: 1 })
+      75        .expect(409);
+      76    });
+     ...
+       78    it('POST /checkout com produto inexistente devolve 404', asy
+           nc () => {
+       79      await request(app.getHttpServer())
+       80        .post('/checkout')
+       81 +      .set('Idempotency-Key', randomUUID())                   
+       82        .send({ productId: 'produto-inexistente', quantity: 1 })
+       83        .expect(404);
+       84    });
+       85 +                                                              
+       86 +  it('POST /checkout sem Idempotency-Key devolve 400', async (
+          +) => {                                                        
+       87 +    const products = await request(app.getHttpServer()).get('/
+          +products');                                                   
+       88 +    const product = products.body[0];                         
+       89 +                                                              
+       90 +    await request(app.getHttpServer())                        
+       91 +      .post('/checkout')                                      
+       92 +      .send({ productId: product.id, quantity: 1 })           
+       93 +      .expect(400);                                           
+       94 +  });                                                         
+       95 +                                                              
+       96 +  it('POST /checkout com Idempotency-Key que não é UUID devolv
+          +e 400', async () => {                                         
+       97 +    const products = await request(app.getHttpServer()).get('/
+          +products');                                                   
+       98 +    const product = products.body[0];                         
+       99 +                                                              
+      100 +    await request(app.getHttpServer())                        
+      101 +      .post('/checkout')                                      
+      102 +      .set('Idempotency-Key', 'nao-e-um-uuid')                
+      103 +      .send({ productId: product.id, quantity: 1 })           
+      104 +      .expect(400);                                           
+      105 +  });                                                         
+      106 +                                                              
+      107 +  it('repetir a mesma Idempotency-Key devolve o mesmo pedido e
+          + decrementa o estoque uma única vez', async () => {           
+      108 +    const products = await request(app.getHttpServer()).get('/
+          +products');                                                   
+      109 +    const product = products.body[0];                         
+      110 +    const key = randomUUID();                                 
+      111 +    const payload = { productId: product.id, quantity: 1 };   
+      112 +                                                              
+      113 +    const first = await request(app.getHttpServer())          
+      114 +      .post('/checkout')                                      
+      115 +      .set('Idempotency-Key', key)                            
+      116 +      .send(payload)                                          
+      117 +      .expect(201);                                           
+      118 +                                                              
+      119 +    const second = await request(app.getHttpServer())         
+      120 +      .post('/checkout')                                      
+      121 +      .set('Idempotency-Key', key)                            
+      122 +      .send(payload)                                          
+      123 +      .expect(201);                                           
+      124 +                                                              
+      125 +    expect(second.body.orderId).toBe(first.body.orderId);     
+      126 +    expect(second.body.remainingStock).toBe(first.body.remaini
+          +ngStock);                                                     
+      127 +                                                              
+      128 +    const afterProducts = await request(app.getHttpServer()).g
+          +et('/products');                                              
+      129 +    const afterProduct = afterProducts.body.find((p: { id: str
+          +ing }) => p.id === product.id);                               
+      130 +    expect(afterProduct.stock).toBe(product.stock - 1);       
+      131 +  });                                                         
+      132 +                                                              
+      133 +  it('Idempotency-Keys diferentes geram compras independentes'
+          +, async () => {                                               
+      134 +    const products = await request(app.getHttpServer()).get('/
+          +products');                                                   
+      135 +    const product = products.body[0];                         
+      136 +    const payload = { productId: product.id, quantity: 1 };   
+      137 +                                                              
+      138 +    const first = await request(app.getHttpServer())          
+      139 +      .post('/checkout')                                      
+      140 +      .set('Idempotency-Key', randomUUID())                   
+      141 +      .send(payload)                                          
+      142 +      .expect(201);                                           
+      143 +                                                              
+      144 +    const second = await request(app.getHttpServer())         
+      145 +      .post('/checkout')                                      
+      146 +      .set('Idempotency-Key', randomUUID())                   
+      147 +      .send(payload)                                          
+      148 +      .expect(201);                                           
+      149 +                                                              
+      150 +    expect(second.body.orderId).not.toBe(first.body.orderId); 
+      151 +                                                              
+      152 +    const afterProducts = await request(app.getHttpServer()).g
+          +et('/products');                                              
+      153 +    const afterProduct = afterProducts.body.find((p: { id: str
+          +ing }) => p.id === product.id);                               
+      154 +    expect(afterProduct.stock).toBe(product.stock - 2);       
+      155 +  });                                                         
+      156 +                                                              
+      157 +  it('reusar a mesma Idempotency-Key com um pedido diferente d
+          +evolve 422', async () => {                                    
+      158 +    const products = await request(app.getHttpServer()).get('/
+          +products');                                                   
+      159 +    const product = products.body[0];                         
+      160 +    const key = randomUUID();                                 
+      161 +                                                              
+      162 +    await request(app.getHttpServer())                        
+      163 +      .post('/checkout')                                      
+      164 +      .set('Idempotency-Key', key)                            
+      165 +      .send({ productId: product.id, quantity: 1 })           
+      166 +      .expect(201);                                           
+      167 +                                                              
+      168 +    await request(app.getHttpServer())                        
+      169 +      .post('/checkout')                                      
+      170 +      .set('Idempotency-Key', key)                            
+      171 +      .send({ productId: product.id, quantity: 2 })           
+      172 +      .expect(422);                                           
+      173 +  });                                                         
+      174  });
+
+● Now let's move to the web side. Let's check the schemas.ts file for style
+  conventions:
+
+  Read 1 file (ctrl+o to expand)
+
+● Now create the idempotency helper module:
+
+● Write(apps\web\src\api\idempotency.ts)
+  ⎿  Wrote 34 lines to apps\web\src\api\idempotency.ts
+       1 export interface PurchaseAttempt {
+       2   key: string;
+       3   fingerprint: string;
+       5 
+       6 /**
+       7  * Identifica um pedido de compra (não a tentativa) para decidir
+          se uma nova
+         do diferente,
+       9  * mesmo que a tentativa anterior tenha falhado.
+      10  */
+     … +32 lines (ctrl+o to expand)
+
+● Write(apps\web\src\api\idempotency.test.ts)
+  ⎿  Wrote 43 lines to apps\web\src\api\idempotency.test.ts
+       1 import { describe, it, expect, vi } from 'vitest';
+       2 import { checkoutFingerprint, resolveAttempt } from './idempoten
+       3 
+       4 describe('checkoutFingerprint', () => {
+       5   it('combina productId e quantity', () => {
+       7   });
+       8 
+       9   it('quantidades diferentes geram fingerprints diferentes', () 
+      10     expect(checkoutFingerprint('case-x', 1)).not.toBe(checkoutFi
+         ngerprint('case-x', 2));
+     … +37 lines (ctrl+o to expand)
+
+● Now update client.ts's postCheckout:
+
+● Update(apps\web\src\api\client.ts)
+  ⎿  Added 6 lines, removed 2 lines
+      123    return request('/api/products', productListSchema);
+      124  }
+      125  
+      126 -export function postCheckout(productId: string, quantity: numb
+          -er): Promise<CheckoutResult> {                                
+      126 +export function postCheckout(                                 
+      127 +  productId: string,                                          
+      128 +  quantity: number,                                           
+      129 +  idempotencyKey: string,                                     
+      130 +): Promise<CheckoutResult> {                                  
+      131    return request('/api/checkout', checkoutResultSchema, {
+      132      method: 'POST',
+      129 -    headers: { 'Content-Type': 'application/json' },          
+      133 +    headers: { 'Content-Type': 'application/json', 'Idempotenc
+          +y-Key': idempotencyKey },                                     
+      134      body: JSON.stringify({ productId, quantity }),
+      135    });
+      136  }
+
+● Now update BuyForm.tsx to use the attempt lifecycle:
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Added 2 lines, removed 1 line
+      1 -import { useState, type FormEvent } from 'react';               
+      1 +import { useRef, useState, type FormEvent } from 'react';       
+      2  import { createQuantitySchema } from '../api/schemas';
+      3  import { postCheckout, ApiError } from '../api/client';
+      4  import type { CheckoutResult } from '../api/schemas';
+      5 +import { checkoutFingerprint, resolveAttempt, type PurchaseAttem
+        +pt } from '../api/idempotency';                                 
+      6  import styles from './BuyForm.module.css';
+      7  
+      8  interface BuyFormProps {
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Added 3 lines
+      16    const [quantity, setQuantity] = useState('1');
+      17    const [fieldError, setFieldError] = useState<string | null>(n
+          ull);
+      18    const [isSubmitting, setIsSubmitting] = useState(false);
+      19 +  // Tentativa de compra em aberto: reusada num retry para que 
+         +a mesma                                                        
+      20 +  // Idempotency-Key seja enviada e a API não processe a compra
+         + duas vezes.                                                   
+      21 +  const attemptRef = useRef<PurchaseAttempt | null>(null);     
+      22  
+      23    const isSoldOut = stock === 0;
+      24  
+
+● Update(apps\web\src\components\BuyForm.tsx)  ⎿  Added 20 lines, removed 5 lines
+      39      }
+      40      setFieldError(null);
+      41  
+      42 +    const attempt = resolveAttempt(                            
+      43 +      attemptRef.current,                                      
+      44 +      checkoutFingerprint(productId, parsed.data),             
+      45 +      () => crypto.randomUUID(),                               
+      46 +    );                                                         
+      47 +    attemptRef.current = attempt;                              
+      48 +                                                               
+      49      setIsSubmitting(true);
+      50      try {
+      44 -      const result = await postCheckout(productId, parsed.data)
+         -;                                                              
+      51 +      const result = await postCheckout(productId, parsed.data,
+         + attempt.key);                                                 
+      52 +      attemptRef.current = null; // sucesso: a próxima compra é
+         + uma tentativa nova                                            
+      53        onSuccess(result);
+      54        setQuantity('1');
+      55      } catch (error) {
+      48 -      const message =                                          
+      49 -        error instanceof ApiError                              
+      50 -          ? error.message                                      
+      51 -          : 'Não foi possível concluir a compra. Tente novament
+         -e.';                                                           
+      56 +      const isApiError = error instanceof ApiError;            
+      57 +      if (!isApiError || !error.retryable) {                   
+      58 +        // Desfecho definitivo (erro de negócio, 4xx): a próxim
+         +a tentativa é                                                  
+      59 +        // um pedido novo, não um retry da mesma compra.       
+      60 +        attemptRef.current = null;                             
+      61 +      }                                                        
+      62 +      // Erro "retryable" (rede/timeout/servidor indisponível):
+         + mantém a                                                      
+      63 +      // chave para que um novo clique reenvie a mesma Idempote
+         +ncy-Key.                                                       
+      64 +      const message = isApiError                               
+      65 +        ? error.message                                        
+      66 +        : 'Não foi possível concluir a compra. Tente novamente.
+         +';                                                             
+      67        onError(message);
+      68      } finally {
+      69        setIsSubmitting(false);
+
+● Let's view the final file to check correctness:
+
+  Read 1 file (ctrl+o to expand)
+
+● TypeScript won't narrow error through the isApiError boolean — let me fix
+  that:
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Added 5 lines, removed 5 lines
+      53        onSuccess(result);
+      54        setQuantity('1');
+      55      } catch (error) {
+      56 -      const isApiError = error instanceof ApiError;            
+      57 -      if (!isApiError || !error.retryable) {                   
+      56 +      if (!(error instanceof ApiError) || !error.retryable) {  
+      57          // Desfecho definitivo (erro de negócio, 4xx): a próxim
+          a tentativa é
+      58          // um pedido novo, não um retry da mesma compra.
+      59          attemptRef.current = null;
+      60        }
+      61        // Erro "retryable" (rede/timeout/servidor indisponível):
+           mantém a
+      62        // chave para que um novo clique reenvie a mesma Idempote
+          ncy-Key.
+      64 -      const message = isApiError                               
+      65 -        ? error.message                                        
+      66 -        : 'Não foi possível concluir a compra. Tente novamente.
+         -';                                                             
+      63 +      const message =                                          
+      64 +        error instanceof ApiError                              
+      65 +          ? error.message                                      
+      66 +          : 'Não foi possível concluir a compra. Tente novament
+         +e.';                                                           
+      67        onError(message);
+      68      } finally {
+      69        setIsSubmitting(false);
+
+● Now update the client.test.ts for postCheckout to test the header:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\web\src\api\client.test.ts)
+  ⎿  Added 23 lines, removed 4 lines
+      199  });
+      200  
+      201  describe('postCheckout', () => {
+      202 -  it('envia productId/quantity e devolve o resultado no caminh
+          -o feliz', async () => {                                       
+      202 +  const idempotencyKey = 'b2c3d4e5-0000-0000-0000-000000000001
+          +';                                                            
+      203 +                                                              
+      204 +  it('envia productId/quantity/Idempotency-Key e devolve o res
+          +ultado no caminho feliz', async () => {                       
+      205      vi.mocked(fetch).mockResolvedValue(jsonResponse(201, valid
+           CheckoutResult));
+      206  
+      205 -    const result = await postCheckout(validProduct.id, 1);    
+      207 +    const result = await postCheckout(validProduct.id, 1, idem
+          +potencyKey);                                                  
+      208  
+      209      expect(result).toEqual(validCheckoutResult);
+      210      expect(fetch).toHaveBeenCalledWith(
+      211        '/api/checkout',
+      212        expect.objectContaining({
+      213          method: 'POST',
+      212 -        headers: { 'Content-Type': 'application/json' },      
+      214 +        headers: { 'Content-Type': 'application/json', 'Idempo
+          +tency-Key': idempotencyKey },                                 
+      215          body: JSON.stringify({ productId: validProduct.id, qua
+           ntity: 1 }),
+      216        }),
+      217      );
+     ...
+      220    it('503 vira mensagem de instabilidade', async () => {
+      221      vi.mocked(fetch).mockResolvedValue(textResponse(503, ''));
+      222  
+      221 -    const error = await expectApiError(postCheckout(validProdu
+          -ct.id, 1));                                                   
+      223 +    const error = await expectApiError(postCheckout(validProdu
+          +ct.id, 1, idempotencyKey));                                   
+      224  
+      225      expect(error.kind).toBe('unavailable');
+      226      expect(error.retryable).toBe(true);
+      227    });
+      228 +                                                              
+      229 +  it('409 de compra duplicada em processamento não é retryable
+          +', async () => {                                              
+      230 +    vi.mocked(fetch).mockResolvedValue(                       
+      231 +      jsonResponse(409, {                                     
+      232 +        statusCode: 409,                                      
+      233 +        message: 'Esta compra já está em processamento',      
+      234 +        error: 'Conflict',                                    
+      235 +      }),                                                     
+      236 +    );                                                        
+      237 +                                                              
+      238 +    const error = await expectApiError(postCheckout(validProdu
+          +ct.id, 1, idempotencyKey));                                   
+      239 +                                                              
+      240 +    expect(error.kind).toBe('http');                          
+      241 +    expect(error.status).toBe(409);                           
+      242 +    expect(error.retryable).toBe(false);                      
+      243 +    expect(error.message).toBe('Esta compra já está em process
+          +amento');                                                     
+      244 +  });                                                         
+      245  });
+
+● Now let's run the tests. Start with the API:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All API unit tests pass. Now the e2e tests:
+
+  Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+● Found it — Nest's @Headers() decorator doesn't support inline pipes (unlike
+  @Body/@Param/@Query), so the pipe argument was silently ignored. Let me fix
+  the controller to validate manually:
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(apps\api\src\checkout\checkout.controller.ts)
+  ⎿  Added 7 lines, removed 5 lines
+       4  import { ZodValidationPipe } from '../common/zod-validation.pip
+          e.js';
+       5  import type { CheckoutResult } from './checkout-result.types.js
+          ';
+       6  
+       7 +// @Headers(), diferente de @Body()/@Param()/@Query(), não acei
+         +ta um pipe como                                                
+       8 +// segundo argumento — o valor precisa ser validado manualmente
+         + no corpo do                                                   
+       9 +// handler. Reaproveita o mesmo ZodValidationPipe usado no @Bod
+         +y().                                                           
+      10 +const idempotencyKeyPipe = new ZodValidationPipe(idempotencyKey
+         +Schema, 'Idempotency-Key inválido');                           
+      11 +                                                               
+      12  @Controller('checkout')
+      13  export class CheckoutController {
+      14    constructor(private readonly checkoutService: CheckoutService
+          ) {}
+     ...
+      16    @Post()
+      17    purchase(
+      18      @Body(new ZodValidationPipe(checkoutSchema)) dto: CheckoutD
+          to,
+      14 -    @Headers(                                                  
+      15 -      'idempotency-key',                                       
+      16 -      new ZodValidationPipe(idempotencyKeySchema, 'Idempotency-
+         -Key inválido'),                                                
+      17 -    )                                                          
+      18 -    idempotencyKey: string,                                    
+      19 +    @Headers('idempotency-key') rawIdempotencyKey: string | und
+         +efined,                                                        
+      20    ): CheckoutResult {
+      21 +    const idempotencyKey = idempotencyKeyPipe.transform(rawIdem
+         +potencyKey) as string;                                         
+      22      return this.checkoutService.purchase(dto, idempotencyKey);
+      23    }
+      24  }
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 11 e2e tests pass. Now let's run the web tests:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All web tests pass. Now let's build and lint both apps:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both build cleanly (no TS errors). Now lint:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That warning is pre-existing (from the previous session, in App.tsx, unrelated
+  to this work) and doesn't fail the build. Both lints are clean.
+
+  Now let's do a manual end-to-end verification with curl. Let's start the API:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Health check works. Now let's test the idempotency behavior:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Same orderId, stock decremented only once (12→11). Now test the fingerprint
+  mismatch and missing header cases:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All scenarios behave exactly as designed. Let's stop the API and clean up:
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● API stopped cleanly. Let's do a final full check per the plan's verification
+  section:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All green: 42 API unit tests + 11 API e2e tests + 21 web tests = 74 tests
+  passing, plus clean builds and lints on both apps, plus manual curl
+  verification of every idempotency scenario. Let me quickly check git status
+  before wrapping up:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Implementação concluída e verificada ponta a ponta. Resumo:
+
+  API (apps/api)
+
+  - src/common/idempotency-store.ts (novo) — store em memória genérico:
+    begin(key, fingerprint) → new / in-flight / replayed / fingerprint-mismatch;
+    complete()/release(). TTL de 10min e teto de 1000 entradas, ambos sem
+    setInterval (limpeza preguiçosa/na inserção).
+  - checkout.service.ts — purchase(dto, idempotencyKey) agora passa pelo store
+    antes de executar a compra: chave repetida com o mesmo pedido devolve o
+    mesmo resultado sem tocar o estoque; chave em voo → 409; chave reciclada
+    para outro pedido → 422; falha de negócio libera a chave para nova
+    tentativa.
+  - checkout.controller.ts — Idempotency-Key via header, validado como UUID.
+    Descobri em runtime que @Headers() do Nest (diferente de
+    @Body/@Param/@Query) não aceita pipe inline — corrigi validando manualmente
+    no handler com o mesmo ZodValidationPipe.
+  - GET /health (novo módulo) — { status: 'ok', uptime, timestamp }.
+  - Testes novos/atualizados em todos os specs + e2e.
+
+  Web (apps/web)
+
+  - src/api/idempotency.ts (novo) — resolveAttempt(): reusa a chave da tentativa
+    corrente se o pedido (productId+quantity) não mudou; gera chave nova caso
+    contrário.
+  - BuyForm.tsx — gera crypto.randomUUID() por tentativa; em erro retryable
+    (rede/timeout/5xx) mantém a chave para o próximo clique reenviar o mesmo
+    header; em sucesso ou erro de negócio (4xx), descarta e a próxima compra usa
+    chave nova.
+  - client.ts — postCheckout envia Idempotency-Key no header.
+
+  Verificação
+
+  - 42 testes unitários API + 11 e2e + 21 web = 74 passando.
+  - pnpm build e pnpm lint limpos nos dois apps (só o warning pré-existente do
+    oxlint em App.tsx, de antes desta sessão).
+  - Testado manualmente via curl: mesma chave 2x → mesmo orderId, estoque cai só
+    1 vez; sem header → 400; UUID inválido → 400; mesma chave com quantidade
+    diferente → 422.
+
+  Nada foi commitado — fica no working tree. Quer que eu faça o commit?
+
+✻ Cooked for 10m 52s · done 9:04
+※ recap: Implementing checkout idempotency and a health endpoint for CaseCellShop, now finished and verified with all tests, builds, and lints passing. Next step: ask you whether to commit the changes. (disable recaps in /config)
+
+> /context 
+  ⎿  Context Usage
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛀ ⛀ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   Sonnet 5
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶   claude-sonnet-5
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   169.2k/1m tokens (17%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ 
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 4.7k tokens (0.5%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 23k tokens (2.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 1k tokens (0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Skills: 10k tokens (1.0%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Messages: 131.2k tokens (13.1%)
+                                               ⛶ Free space: 797.1k (79.7%)
+                                               ⛝ Autocompact buffer: 33k tokens (3.3%)
+
+     Auto-compact window: 1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 258 tools · 0 tokens
+
+     Custom agents · .claude/agents/
+     └ 12 agents · 1k tokens
+
+     Skills · /skills
+     └ 120 skills · 10k tokens
+
+     /context all to expand
