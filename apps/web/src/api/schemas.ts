@@ -24,11 +24,6 @@ export const checkoutResultSchema = z.object({
 
 export type CheckoutResult = z.infer<typeof checkoutResultSchema>;
 
-/**
- * Validação de quantidade no formulário de compra. É parametrizada pelo
- * estoque disponível para garantir, já no front, que a quantidade
- * solicitada não seja maior que o estoque (regra do PRD).
- */
 export function createQuantitySchema(stock: number) {
   return z
     .number()
