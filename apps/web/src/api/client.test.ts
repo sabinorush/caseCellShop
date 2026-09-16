@@ -199,17 +199,19 @@ describe('getProducts', () => {
 });
 
 describe('postCheckout', () => {
-  it('envia productId/quantity e devolve o resultado no caminho feliz', async () => {
+  const idempotencyKey = 'b2c3d4e5-0000-0000-0000-000000000001';
+
+  it('envia productId/quantity/Idempotency-Key e devolve o resultado no caminho feliz', async () => {
     vi.mocked(fetch).mockResolvedValue(jsonResponse(201, validCheckoutResult));
 
-    const result = await postCheckout(validProduct.id, 1);
+    const result = await postCheckout(validProduct.id, 1, idempotencyKey);
 
     expect(result).toEqual(validCheckoutResult);
     expect(fetch).toHaveBeenCalledWith(
       '/api/checkout',
       expect.objectContaining({
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({ productId: validProduct.id, quantity: 1 }),
       }),
     );
@@ -218,9 +220,26 @@ describe('postCheckout', () => {
   it('503 vira mensagem de instabilidade', async () => {
     vi.mocked(fetch).mockResolvedValue(textResponse(503, ''));
 
-    const error = await expectApiError(postCheckout(validProduct.id, 1));
+    const error = await expectApiError(postCheckout(validProduct.id, 1, idempotencyKey));
 
     expect(error.kind).toBe('unavailable');
     expect(error.retryable).toBe(true);
+  });
+
+  it('409 de compra duplicada em processamento não é retryable', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      jsonResponse(409, {
+        statusCode: 409,
+        message: 'Esta compra já está em processamento',
+        error: 'Conflict',
+      }),
+    );
+
+    const error = await expectApiError(postCheckout(validProduct.id, 1, idempotencyKey));
+
+    expect(error.kind).toBe('http');
+    expect(error.status).toBe(409);
+    expect(error.retryable).toBe(false);
+    expect(error.message).toBe('Esta compra já está em processamento');
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { checkoutSchema } from './checkout.schema.js';
+import { checkoutSchema, idempotencyKeySchema } from './checkout.schema.js';
 
 describe('checkoutSchema', () => {
   it('aceita um payload válido', () => {
@@ -49,6 +49,23 @@ describe('checkoutSchema', () => {
 
   it('rejeita productId vazio', () => {
     const result = checkoutSchema.safeParse({ productId: '', quantity: 1 });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('idempotencyKeySchema', () => {
+  it('aceita um UUID válido', () => {
+    const result = idempotencyKeySchema.safeParse('550e8400-e29b-41d4-a716-446655440000');
+    expect(result.success).toBe(true);
+  });
+
+  it('rejeita uma string que não é UUID', () => {
+    const result = idempotencyKeySchema.safeParse('minha-chave-qualquer');
+    expect(result.success).toBe(false);
+  });
+
+  it('rejeita valor ausente', () => {
+    const result = idempotencyKeySchema.safeParse(undefined);
     expect(result.success).toBe(false);
   });
 });

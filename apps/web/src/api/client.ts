@@ -123,10 +123,14 @@ export function getProducts(): Promise<Product[]> {
   return request('/api/products', productListSchema);
 }
 
-export function postCheckout(productId: string, quantity: number): Promise<CheckoutResult> {
+export function postCheckout(
+  productId: string,
+  quantity: number,
+  idempotencyKey: string,
+): Promise<CheckoutResult> {
   return request('/api/checkout', checkoutResultSchema, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ productId, quantity }),
   });
 }

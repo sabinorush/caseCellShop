@@ -10,3 +10,5 @@ export const checkoutSchema = z.object({
 });
 
 export type CheckoutDto = z.infer<typeof checkoutSchema>;
+
+export const idempotencyKeySchema = z.uuid('Idempotency-Key deve ser um UUID');
