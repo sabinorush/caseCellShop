@@ -1,0 +1,16 @@
+{
+  "name": "casecellshop",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:api": "pnpm --filter @casecellshop/api dev",
+    "dev:web": "pnpm --filter @casecellshop/web dev",
+    "build": "pnpm -r build",
+    "build:api": "pnpm --filter @casecellshop/api build",
+    "build:web": "pnpm --filter @casecellshop/web build",
+    "test": "pnpm --filter @casecellshop/api test",
+    "test:api": "pnpm --filter @casecellshop/api test",
+    "test:api:e2e": "pnpm --filter @casecellshop/api test:e2e",
+    "lint": "pnpm -r lint"
+  }
+}

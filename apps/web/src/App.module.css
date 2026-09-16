@@ -1,0 +1,43 @@
+.page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 3rem;
+}
+
+.title {
+  margin: 0 0 0.25rem;
+}
+
+.subtitle {
+  margin: 0 0 1.5rem;
+  color: #6e6e73;
+}
+
+.banner {
+  margin-bottom: 1.5rem;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.bannerSuccess {
+  background-color: #e6f6ea;
+  color: #1e7a34;
+  border: 1px solid #b7e4c3;
+}
+
+.bannerError {
+  background-color: #fdecea;
+  color: #a02f24;
+  border: 1px solid #f3c2bd;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.status {
+  color: #6e6e73;
+}

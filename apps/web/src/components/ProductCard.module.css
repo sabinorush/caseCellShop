@@ -1,0 +1,35 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 1rem;
+  border-radius: 10px;
+  background-color: #fff;
+  border: 1px solid #e5e5e8;
+}
+
+.model {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #6e6e73;
+}
+
+.name {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.price {
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.stock {
+  font-size: 0.8rem;
+  color: #6e6e73;
+}
+
+.stockZero {
+  color: #c0392b;
+}
