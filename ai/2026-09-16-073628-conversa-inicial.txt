@@ -1,0 +1,1360 @@
+ ▐▛███▛█   Claude Code v2.1.273
+▝▜██████▀  Opus 5 · Claude Pro
+  ▝▝ ▝▝    ~\projects\CaseCellShop
+
+
+> /plan                                                                         
+  ⎿  Enabled plan mode
+
+> /model 
+  ⎿  Kept model as Opus in plan mode, else Sonnet
+
+> Vamos iniciar o projeto descrito em @PRD.md se tiver duvidas pergunte, não    
+  assuma nada.                                                                  
+  ⎿  Read PRD.md (28 lines)
+
+  Listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● O projeto está vazio (só o PRD.md), então é greenfield. Node v24 e pnpm 10.5.2
+  estão disponíveis. Antes de escrever o plano, algumas dúvidas que mudam
+  bastante a implementação:
+
+● User answered Claude's questions:
+  ⎿  · Qual o fluxo de compra no front-end? → Compra direta (1 produto)
+     · O checkout deve coletar dados do cliente (para ter algo real a validar 
+     com Zod)? → Só quantidade
+     · Incluir testes automatizados? → Sim, só no back-end
+     · Idioma para código e interface? → UI pt-BR, código em inglês
+
+● Respostas anotadas. Vou escrever o plano.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: 
+     ~\.claude\plans\vamos-iniciar-o-projeto-iridescent-peacock.md · /plan to 
+     edit
+     CaseCellShop — Setup inicial do monorepo
+
+     Context
+
+     O diretório C:\Users\gusab\projects\CaseCellShop contém apenas o PRD.md.
+     Não há código, nem repositório git. O objetivo é criar do zero um monorepo
+     pnpm com uma loja mínima de capas de celular que permita testar ponta a
+     ponta o fluxo de compra e as três regras de negócio do PRD (estoque não
+     pode ser estourado, estoque só cai em compra bem-sucedida, botão não pode
+     enviar duas vezes).
+
+     Decisões confirmadas com o usuário:
+     - Compra direta de 1 produto (sem carrinho): lista → escolhe quantidade →
+       botão Comprar.
+     - Sem formulário de dados do cliente: o checkout envia só productId +
+       quantity. O Zod valida a quantidade (inteiro, ≥ 1, ≤ estoque) no front e
+       o payload no back.
+     - Testes só no back-end, com o Jest que já vem no Nest.
+     - UI em pt-BR, código/rotas em inglês.
+
+     Fora de escopo (PRD): auth, gateway de pagamento, banco persistente,
+     deploy, docker, layout elaborado.
+
+     ---
+
+     Estrutura alvo
+
+     CaseCellShop/
+     ├─ package.json            # scripts com --filter
+     ├─ pnpm-workspace.yaml     # packages: apps/*
+     ├─ .gitignore
+     ├─ PRD.md
+     └─ apps/
+        ├─ api/                 # NestJS
+        └─ web/                 # React + TS + Vite
+
+     Raiz (package.json), sem navegar entre pastas:
+
+     ┌───────────────────┬─────────────────────────────────────────────────────┐
+     │      script       │                       comando                       │
+     ├───────────────────┼─────────────────────────────────────────────────────┤
+     │ dev               │ roda api e web em paralelo (pnpm -r --parallel dev) │
+     ├───────────────────┼─────────────────────────────────────────────────────┤
+     │ dev:api / dev:web │ pnpm --filter @casecellshop/api dev etc.            │
+     ├───────────────────┼─────────────────────────────────────────────────────┤
+     │ build             │ pnpm -r build                                       │
+     ├───────────────────┼─────────────────────────────────────────────────────┤
+     │ test / test:api   │ pnpm --filter @casecellshop/api test                │
+     └───────────────────┴─────────────────────────────────────────────────────┘
+
+     ---
+
+     Passo 1 — Scaffolding
+
+     1. git init na raiz + .gitignore (node_modules, dist, .env*, logs).
+     2. pnpm-workspace.yaml com packages: ["apps/*"]; package.json raiz privado
+        com os scripts acima.
+     3. API: pnpm dlx @nestjs/cli new api --package-manager pnpm --skip-git 
+        --skip-install dentro de apps/, depois pnpm dlx @nestjs/cli generate 
+        resource checkout e ... generate resource products (REST, sem CRUD
+        completo — vou enxugar os handlers gerados que não uso).
+     4. Web: pnpm create vite@latest web --template react-ts dentro de apps/.
+     5. Renomear os pacotes para @casecellshop/api e @casecellshop/web; garantir
+        script dev em cada um (nest start --watch / vite).
+     6. Instalar zod nos dois apps.
+
+     Passo 2 — Back-end (apps/api)
+
+     Catálogo em memória — src/products/products.data.ts: ~6 capas com id, name,
+     model, priceCents, stock. Preço em centavos (inteiro) para não ter float
+     em dinheiro.
+
+     - products.service.ts: guarda o array como estado mutável do singleton;
+       expõe findAll(), findOne(id) e decreaseStock(id, quantity). Toda a lógica
+       de estoque vive aqui — é o único ponto que muta o array.
+     - products.controller.ts: só GET /products.
+     - checkout.service.ts: recebe { productId, quantity }, busca o produto (404
+       NotFoundException se não existir), e chama decreaseStock. A checagem
+       quantity > stock e o decremento ficam no mesmo bloco síncrono, sem await
+       no meio — como o Node é single-threaded, isso torna a operação
+       efetivamente atômica e duas requisições simultâneas não conseguem
+       estourar o estoque. Se faltar estoque → ConflictException (409) e nada é 
+       decrementado.
+     - Retorno do POST /checkout (201): { orderId, productId, productName, 
+       quantity, unitPriceCents, totalCents, remainingStock }. orderId via
+       randomUUID().
+     - Zod no Nest: um ZodValidationPipe genérico em
+       src/common/zod-validation.pipe.ts que recebe um schema, roda safeParse e
+       lança BadRequestException (400) com os issues formatados. Aplicado no
+       @Body() do checkout com o schema de src/checkout/checkout.schema.ts
+       (productId: string min 1, quantity: int positivo, max razoável). Tipo do
+       DTO inferido com z.infer.
+     - main.ts: app.enableCors() (a UI usa proxy do Vite, mas o CORS deixa a API
+       testável direto pelo navegador/curl) e porta 3000.
+
+     Testes (Jest)
+     - checkout.service.spec.ts: compra válida retorna total certo e reduz o
+       estoque; quantity > stock lança 409 e o estoque permanece intacto (a
+       regra 2 do PRD); produto inexistente lança 404; compras sequenciais até
+       zerar o estoque funcionam e a seguinte falha.
+     - products.service.spec.ts: findAll devolve o catálogo; decreaseStock
+       rejeita quantidade maior que o estoque.
+     - checkout.schema.spec.ts: rejeita quantidade 0, negativa, fracionária e
+       não-numérica.
+     - test/app.e2e-spec.ts: GET /products → 200 com lista; POST /checkout feliz
+       → 201; payload inválido → 400; estoque insuficiente → 409.
+     - Cada suíte reconstrói o módulo de teste para partir de um catálogo limpo
+       (seed exportado como função createProducts() que devolve uma cópia nova,
+       evitando vazamento de estado entre testes).
+
+     Passo 3 — Front-end (apps/web)
+
+     - vite.config.ts: proxy /api → http://localhost:3000 (evita lidar com
+       CORS/URLs em dev).
+     - src/api/client.ts: getProducts() e postCheckout() com fetch; parseia a
+       resposta com schemas Zod (src/api/schemas.ts) para validar também o que
+       vem da API; erros HTTP viram uma ApiError com a mensagem do back.
+     - src/App.tsx: carrega os produtos no mount, renderiza a grade e um banner
+       de sucesso/erro.
+     - src/components/ProductCard.tsx + ProductCard.module.css: nome, modelo,
+       preço formatado (Intl.NumberFormat pt-BR), estoque e o formulário de
+       compra.
+     - src/components/BuyForm.tsx: input numérico de quantidade + botão Comprar.
+       - Validação com Zod no submit (quantitySchema(stock)): mensagens em pt-BR
+         ("Informe uma quantidade válida", "Quantidade maior que o estoque
+         disponível").
+       - Anti-duplo-envio: estado isSubmitting; o handler retorna cedo se já
+         estiver enviando, o <button disabled={isSubmitting}> muda o texto para
+         "Comprando…", e o finally religa. Produto sem estoque → botão
+         desabilitado com "Esgotado".
+       - Após sucesso, o stock do produto é atualizado no estado do App com o
+         remainingStock devolvido pela API (fonte da verdade é o back).
+     - Estilos com CSS Modules apenas (*.module.css), layout simples em grid,
+       sem biblioteca de UI.
+
+     ---
+
+     Arquivos críticos
+
+     - apps/api/src/products/products.service.ts — dono do estoque; onde as
+       regras 1 e 2 são garantidas.
+     - apps/api/src/checkout/checkout.service.ts — orquestra a compra e mapeia
+       os erros de domínio para 404/409.
+     - apps/api/src/common/zod-validation.pipe.ts — ponte Zod ↔ Nest.
+     - apps/web/src/components/BuyForm.tsx — onde a regra 3 (sem envio
+       duplicado) é garantida.
+     - package.json (raiz) e pnpm-workspace.yaml — atalhos com --filter.
+
+     Verificação
+
+     1. pnpm install na raiz; pnpm test:api → todas as suítes passando.
+     2. pnpm dev e abrir http://localhost:5173: a grade de produtos carrega.
+     3. Comprar 1 unidade → banner de sucesso e o estoque no card cai.
+     4. Tentar comprar mais do que o estoque → erro em pt-BR e o estoque não 
+        muda (confirmar com curl http://localhost:3000/products).
+     5. Zerar o estoque de um produto → botão vira "Esgotado".
+     6. Duplo-clique rápido no Comprar → o botão trava em "Comprando…" e só uma
+        requisição sai (conferir na aba Network).
+     7. curl -X POST http://localhost:3000/checkout -H "Content-Type: 
+        application/json" -d '{"quantity":0}' → 400 com os erros do Zod.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(.gitignore)
+  ⎿  Wrote 13 lines to .gitignore
+       1 node_modules/
+       2 dist/
+       3 build/
+       4 .env
+       5 .env.*
+       6 !.env.example
+       7 *.log
+       8 npm-debug.log*
+       9 pnpm-debug.log*
+      10 coverage/
+     … +3 lines (ctrl+o to expand)
+
+● Write(pnpm-workspace.yaml)
+  ⎿  Wrote 2 lines to pnpm-workspace.yaml
+      1 packages:
+      2   - "apps/*"
+
+● Write(package.json)
+  ⎿  Wrote 16 lines to package.json
+       1 {
+       2   "name": "casecellshop",
+       3   "private": true,
+       4   "scripts": {
+       5     "dev": "pnpm -r --parallel dev",
+       6     "dev:api": "pnpm --filter @casecellshop/api dev",
+       7     "dev:web": "pnpm --filter @casecellshop/web dev",
+       8     "build": "pnpm -r build",
+       9     "build:api": "pnpm --filter @casecellshop/api build",
+      10     "build:web": "pnpm --filter @casecellshop/web build",
+     … +6 lines (ctrl+o to expand)
+
+● Agora vou fazer o scaffolding das duas apps via CLI.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● O Nest CLI atual já vem com Vitest por padrão (não mais Jest) — vou seguir com
+  Vitest, mesma cobertura de testes planejada, é só o runner que mudou.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Vou remover isso — o install correto será feito com pnpm na raiz depois.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agora o resource checkout:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Bom, nada foi instalado dessa vez. Agora o scaffold do front-end:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agora vou ajustar os nomes dos pacotes e revisar as estruturas geradas.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Bom. Agora renomeio os pacotes, adiciono scripts dev e limpo os generated CRUD
+  extras (DTOs de create/update completo, entities vazias) que não vou usar.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\api\package.json)
+  ⎿  Added 4 lines, removed 3 lines
+      1  {
+      2 -  "name": "api",                                                
+      2 +  "name": "@casecellshop/api",                                  
+      3    "version": "0.0.1",
+      4    "description": "",
+      5    "author": "",
+     ...
+      11      "deploy": "nest deploy",
+      12      "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\
+          "",
+      13      "start": "nest start",
+      14 +    "dev": "nest start --watch",                               
+      15      "start:dev": "nest start --watch",
+      16      "start:debug": "nest start --debug --watch",
+      17      "start:prod": "node dist/main",
+     ...
+      25    "dependencies": {
+      26      "@nestjs/common": "^12.0.1",
+      27      "@nestjs/core": "^12.0.1",
+      27 -    "@nestjs/mapped-types": "*",                               
+      28      "@nestjs/platform-express": "^12.0.1",
+      29      "reflect-metadata": "^0.2.2",
+      30 -    "rxjs": "^7.8.1"                                           
+      30 +    "rxjs": "^7.8.1",                                          
+      31 +    "zod": "^3.24.1"                                           
+      32    },
+      33    "devDependencies": {
+      34      "@nestjs/cli": "^12.0.0",
+● Agora vou limpar os arquivos gerados que não vou usar (update dtos, entities
+  vazias, create dtos genéricos) e ver os controllers/services gerados antes de
+  reescrevê-los.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Todos vazios/stubs. Vou remover essas pastas dto/entities geradas (vou criar
+  meus próprios arquivos de schema/types) e reescrever
+  controllers/services/modules do zero.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agora vou escrever o código de negócio. Primeiro os tipos/dados de produto:
+
+● Write(apps\api\src\products\product.types.ts)
+  ⎿  Wrote 7 lines to apps\api\src\products\product.types.ts
+      1 export interface Product {
+      2   id: string;
+      3   name: string;
+      4   model: string;
+      5   priceCents: number;
+      6   stock: number;
+      7 }
+
+● Write(apps\api\src\products\products.data.ts)
+  ⎿  Wrote 53 lines to apps\api\src\products\products.data.ts
+       1 import type { Product } from './product.types.js';
+       2 
+       3 /**
+          nova,
+       5  * para que testes e o serviço singleton nunca compartilhem a me
+         sma
+       6  * referência de array/objetos entre si.
+       8 export function createInitialProducts(): Product[] {
+       9   return [
+      10     {
+     … +44 lines (ctrl+o to expand)
+
+● Agora o products.service.ts — dono do estoque:
+
+● Write(apps\api\src\products\products.service.ts)
+  ⎿  Added 50 lines, removed 14 lines
+       1 -import { Injectable } from '@nestjs/common';                   
+       2 -import { CreateProductDto } from './dto/create-product.dto.js';
+       3 -import { UpdateProductDto } from './dto/update-product.dto.js';
+       1 +import { Injectable, NotFoundException } from '@nestjs/common';
+       2 +import { createInitialProducts } from './products.data.js';    
+       3 +import type { Product } from './product.types.js';             
+       4  
+       5 +/**                                                            
+       6 + * Dono do estoque. É o único lugar do sistema que muta o catál
+         +ogo em                                                         
+       7 + * memória, garantindo:                                        
+       8 + *  - regra 1: a quantidade solicitada não pode ser maior que o
+         + estoque.                                                      
+       9 + *  - regra 2: o estoque só é reduzido em uma compra bem-sucedi
+         +da.                                                            
+      10 + *                                                             
+      11 + * `decreaseStock` verifica e decrementa no mesmo bloco síncron
+         +o (sem                                                         
+      12 + * `await` no meio). Como o event loop do Node processa cada re
+         +quisição                                                       
+      13 + * de forma cooperativa e não há ponto de suspensão aqui, duas 
+         +chamadas                                                       
+      14 + * concorrentes nunca intercalam entre a checagem e a escrita —
+         + a                                                             
+      15 + * operação é efetivamente atômica.                            
+      16 + */                                                            
+      17  @Injectable()
+      18  export class ProductsService {
+       7 -  create(createProductDto: CreateProductDto) {                 
+       8 -    return 'This action adds a new product';                   
+       9 -  }                                                            
+      19 +  private readonly products: Product[] = createInitialProducts(
+         +);                                                             
+      20  
+      11 -  findAll() {                                                  
+      12 -    return `This action returns all products`;                 
+      21 +  findAll(): Product[] {                                       
+      22 +    return this.products.map((product) => ({ ...product }));   
+      23    }
+      24  
+      15 -  findOne(id: number) {                                        
+      16 -    return `This action returns a #${id} product`;             
+      25 +  findOne(id: string): Product {                               
+      26 +    const product = this.products.find((item) => item.id === id
+         +);                                                             
+      27 +    if (!product) {                                            
+      28 +      throw new NotFoundException(`Produto "${id}" não encontra
+         +do`);                                                          
+      29 +    }                                                          
+      30 +    return { ...product };                                     
+      31    }
+      32  
+      19 -  update(id: number, updateProductDto: UpdateProductDto) {     
+      20 -    return `This action updates a #${id} product`;             
+      33 +  /**                                                          
+      34 +   * Reduz o estoque do produto em `quantity` unidades.        
+      35 +   * Lança se o produto não existir ou se o estoque for insufic
+         +iente;                                                         
+      36 +   * em ambos os casos nada é alterado.                        
+      37 +   */                                                          
+      38 +  decreaseStock(id: string, quantity: number): Product {       
+      39 +    const product = this.products.find((item) => item.id === id
+         +);                                                             
+      40 +    if (!product) {                                            
+      41 +      throw new NotFoundException(`Produto "${id}" não encontra
+         +do`);                                                          
+      42 +    }                                                          
+      43 +    if (quantity > product.stock) {                            
+      44 +      throw new InsufficientStockError(product, quantity);     
+      45 +    }                                                          
+      46 +                                                               
+      47 +    product.stock -= quantity;                                 
+      48 +    return { ...product };                                     
+      49    }
+      50 +}                                                              
+      51  
+      23 -  remove(id: number) {                                         
+      24 -    return `This action removes a #${id} product`;             
+      52 +export class InsufficientStockError extends Error {            
+      53 +  constructor(                                                 
+      54 +    public readonly product: Product,                          
+      55 +    public readonly requestedQuantity: number,                 
+      56 +  ) {                                                          
+      57 +    super(                                                     
+      58 +      `Estoque insuficiente para "${product.name}": solicitado 
+         +${requestedQuantity}, disponível ${product.stock}`,            
+      59 +    );                                                         
+      60 +    this.name = 'InsufficientStockError';                      
+      61    }
+      62  }
+
+● Write(apps\api\src\products\products.controller.ts)
+  ⎿  Added 3 lines, removed 24 lines
+       1 -import { Controller, Get, Post, Body, Patch, Param, Delete } fr
+         -om '@nestjs/common';                                           
+       1 +import { Controller, Get } from '@nestjs/common';              
+       2  import { ProductsService } from './products.service.js';
+       3 -import { CreateProductDto } from './dto/create-product.dto.js';
+       4 -import { UpdateProductDto } from './dto/update-product.dto.js';
+       3 +import type { Product } from './product.types.js';             
+       4  
+       5  @Controller('products')
+       6  export class ProductsController {
+       7    constructor(private readonly productsService: ProductsService
+          ) {}
+       8  
+      10 -  @Post()                                                      
+      11 -  create(@Body() createProductDto: CreateProductDto) {         
+      12 -    return this.productsService.create(createProductDto);      
+      13 -  }                                                            
+      14 -                                                               
+       9    @Get()
+      16 -  findAll() {                                                  
+      10 +  findAll(): Product[] {                                       
+      11      return this.productsService.findAll();
+      12    }
+      19 -                                                               
+      20 -  @Get(':id')                                                  
+      21 -  findOne(@Param('id') id: string) {                           
+      22 -    return this.productsService.findOne(+id);                  
+      23 -  }                                                            
+      24 -                                                               
+      25 -  @Patch(':id')                                                
+      26 -  update(@Param('id') id: string, @Body() updateProductDto: Upd
+         -ateProductDto) {                                               
+      27 -    return this.productsService.update(+id, updateProductDto); 
+      28 -  }                                                            
+      29 -                                                               
+      30 -  @Delete(':id')                                               
+      31 -  remove(@Param('id') id: string) {                            
+      32 -    return this.productsService.remove(+id);                   
+      33 -  }                                                            
+      13  }
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\api\src\products\products.module.ts)
+  ⎿  Added 1 line
+       5  @Module({
+       6    controllers: [ProductsController],
+       7    providers: [ProductsService],
+       8 +  exports: [ProductsService],                                  
+       9  })
+      10  export class ProductsModule {}
+
+● Agora o schema Zod e o pipe de validação genérico:
+
+● Write(apps\api\src\common\zod-validation.pipe.ts)
+  ⎿  Wrote 25 lines to apps\api\src\common\zod-validation.pipe.ts
+       1 import { BadRequestException, type PipeTransform } from '@nestjs
+       2 import type { ZodType } from 'zod';
+       3 
+       4 /**
+         chema Zod
+       6  * e transforma falhas de validação em 400 Bad Request com os `i
+       7  * formatados (caminho + mensagem), em vez do payload bruto do Z
+         od.
+       8  */
+      10   constructor(private readonly schema: ZodType) {}
+     … +18 lines (ctrl+o to expand)
+
+● Write(apps\api\src\checkout\checkout.schema.ts)
+  ⎿  Wrote 14 lines to apps\api\src\checkout\checkout.schema.ts
+       1 import { z } from 'zod';
+       2 
+       3 export const checkoutSchema = z.object({
+       4   productId: z
+       5     .string({ message: 'productId é obrigatório' })
+       6     .min(1, 'productId é obrigatório'),
+       7   quantity: z
+       8     .number({ message: 'quantity deve ser um número' })
+       9     .int('quantity deve ser um número inteiro')
+      10     .positive('quantity deve ser maior que zero')
+     … +4 lines (ctrl+o to expand)
+
+● Write(apps\api\src\checkout\checkout-result.types.ts)
+  ⎿  Wrote 9 lines to apps\api\src\checkout\checkout-result.types.ts
+      1 export interface CheckoutResult {
+      2   orderId: string;
+      3   productId: string;
+      4   productName: string;
+      5   quantity: number;
+      6   unitPriceCents: number;
+      7   totalCents: number;
+      8   remainingStock: number;
+      9 }
+
+● Write(apps\api\src\checkout\checkout.service.ts)
+  ⎿  Added 29 lines, removed 18 lines
+       1 -import { Injectable } from '@nestjs/common';                   
+       2 -import { CreateCheckoutDto } from './dto/create-checkout.dto.js
+         -';                                                             
+       3 -import { UpdateCheckoutDto } from './dto/update-checkout.dto.js
+         -';                                                             
+       1 +import { ConflictException, Injectable } from '@nestjs/common';
+       2 +import { randomUUID } from 'node:crypto';                      
+       3 +import {                                                       
+       4 +  InsufficientStockError,                                      
+       5 +  ProductsService,                                             
+       6 +} from '../products/products.service.js';                      
+       7 +import type { CheckoutDto } from './checkout.schema.js';       
+       8 +import type { CheckoutResult } from './checkout-result.types.js
+         +';                                                             
+       9  
+      10  @Injectable()
+      11  export class CheckoutService {
+       7 -  create(createCheckoutDto: CreateCheckoutDto) {               
+       8 -    return 'This action adds a new checkout';                  
+       9 -  }                                                            
+      12 +  constructor(private readonly productsService: ProductsService
+         +) {}                                                           
+      13  
+      11 -  findAll() {                                                  
+      12 -    return `This action returns all checkout`;                 
+      13 -  }                                                            
+      14 +  purchase(dto: CheckoutDto): CheckoutResult {                 
+      15 +    const product = this.productsService.findOne(dto.productId)
+         +;                                                              
+      16  
+      15 -  findOne(id: number) {                                        
+      16 -    return `This action returns a #${id} checkout`;            
+      17 -  }                                                            
+      17 +    let updated;                                               
+      18 +    try {                                                      
+      19 +      updated = this.productsService.decreaseStock(dto.productI
+         +d, dto.quantity);                                              
+      20 +    } catch (error) {                                          
+      21 +      if (error instanceof InsufficientStockError) {           
+      22 +        throw new ConflictException(error.message);            
+      23 +      }                                                        
+      24 +      throw error;                                             
+      25 +    }                                                          
+      26  
+      19 -  update(id: number, updateCheckoutDto: UpdateCheckoutDto) {   
+      20 -    return `This action updates a #${id} checkout`;            
+      27 +    return {                                                   
+      28 +      orderId: randomUUID(),                                   
+      29 +      productId: updated.id,                                   
+      30 +      productName: product.name,                               
+      31 +      quantity: dto.quantity,                                  
+      32 +      unitPriceCents: product.priceCents,                      
+      33 +      totalCents: product.priceCents * dto.quantity,           
+      34 +      remainingStock: updated.stock,                           
+      35 +    };                                                         
+      36    }
+      22 -                                                               
+      23 -  remove(id: number) {                                         
+      24 -    return `This action removes a #${id} checkout`;            
+      25 -  }                                                            
+      37  }
+
+● Write(apps\api\src\checkout\checkout.controller.ts)
+  ⎿  Added 7 lines, removed 25 lines
+       1 -import { Controller, Get, Post, Body, Patch, Param, Delete } fr
+         -om '@nestjs/common';                                           
+       1 +import { Body, Controller, Post, UsePipes } from '@nestjs/commo
+         +n';                                                            
+       2  import { CheckoutService } from './checkout.service.js';
+       3 -import { CreateCheckoutDto } from './dto/create-checkout.dto.js
+         -';                                                             
+       4 -import { UpdateCheckoutDto } from './dto/update-checkout.dto.js
+         -';                                                             
+       3 +import { checkoutSchema, type CheckoutDto } from './checkout.sc
+         +hema.js';                                                      
+       4 +import { ZodValidationPipe } from '../common/zod-validation.pip
+         +e.js';                                                         
+       5 +import type { CheckoutResult } from './checkout-result.types.js
+         +';                                                             
+       6  
+       7  @Controller('checkout')
+       8  export class CheckoutController {
+       9    constructor(private readonly checkoutService: CheckoutService
+          ) {}
+      10  
+      11    @Post()
+      11 -  create(@Body() createCheckoutDto: CreateCheckoutDto) {       
+      12 -    return this.checkoutService.create(createCheckoutDto);     
+      12 +  @UsePipes(new ZodValidationPipe(checkoutSchema))             
+      13 +  purchase(@Body() dto: CheckoutDto): CheckoutResult {         
+      14 +    return this.checkoutService.purchase(dto);                 
+      15    }
+      14 -                                                               
+      15 -  @Get()                                                       
+      16 -  findAll() {                                                  
+      17 -    return this.checkoutService.findAll();                     
+      18 -  }                                                            
+      19 -                                                               
+      20 -  @Get(':id')                                                  
+      21 -  findOne(@Param('id') id: string) {                           
+      22 -    return this.checkoutService.findOne(+id);                  
+      23 -  }                                                            
+      24 -                                                               
+      25 -  @Patch(':id')                                                
+      26 -  update(@Param('id') id: string, @Body() updateCheckoutDto: Up
+         -dateCheckoutDto) {                                             
+      27 -    return this.checkoutService.update(+id, updateCheckoutDto);
+      28 -  }                                                            
+      29 -                                                               
+      30 -  @Delete(':id')                                               
+      31 -  remove(@Param('id') id: string) {                            
+      32 -    return this.checkoutService.remove(+id);                   
+      33 -  }                                                            
+      16  }
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\api\src\checkout\checkout.module.ts)
+  ⎿  Added 2 lines
+       1  import { Module } from '@nestjs/common';
+       2  import { CheckoutService } from './checkout.service.js';
+       3  import { CheckoutController } from './checkout.controller.js';
+       4 +import { ProductsModule } from '../products/products.module.js'
+         +;                                                              
+       5  
+       6  @Module({
+       7 +  imports: [ProductsModule],                                   
+       8    controllers: [CheckoutController],
+       9    providers: [CheckoutService],
+      10  })
+
+● Agora vamos revisar app.module.ts, app.controller.ts/app.service.ts
+  (removê-los, pois não precisamos de endpoint raiz de exemplo) e main.ts.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Write(apps\api\src\app.module.ts)
+  ⎿  Removed 4 lines
+       1  import { Module } from '@nestjs/common';
+       2 -import { AppController } from './app.controller.js';           
+       3 -import { AppService } from './app.service.js';                 
+       2  import { ProductsModule } from './products/products.module.js';
+       3  import { CheckoutModule } from './checkout/checkout.module.js';
+       4  
+       5  @Module({
+       6    imports: [ProductsModule, CheckoutModule],
+       9 -  controllers: [AppController],                                
+      10 -  providers: [AppService],                                     
+       7  })
+       8  export class AppModule {}
+
+● Write(apps\api\src\main.ts)
+  ⎿  Added 1 line
+      3  
+      4  async function bootstrap() {
+      5    const app = await NestFactory.create(AppModule);
+      6 +  app.enableCors();                                             
+      7    await app.listen(process.env.PORT ?? 3000);
+      8  }
+      9  await bootstrap();
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Vou reescrever o e2e spec para cobrir products/checkout, e criar os testes
+  unitários. Primeiro os specs unitários:
+
+● Write(apps\api\src\products\products.service.spec.ts)  ⎿  Wrote 62 lines to apps\api\src\products\products.service.spec.ts
+       1 import { describe, it, expect, beforeEach } from 'vitest';
+       2 import { NotFoundException } from '@nestjs/common';
+       3 import { ProductsService, InsufficientStockError } from './produ
+         cts.service.js';
+       4 
+       6   let service: ProductsService;
+       7 
+       8   beforeEach(() => {
+       9     service = new ProductsService();
+      10   });
+     … +59 lines (ctrl+o to expand)
+
+● Write(apps\api\src\checkout\checkout.schema.spec.ts)
+  ⎿  Wrote 54 lines to apps\api\src\checkout\checkout.schema.spec.ts
+       1 import { describe, it, expect } from 'vitest';
+       2 import { checkoutSchema } from './checkout.schema.js';
+       3 
+       4 describe('checkoutSchema', () => {
+       5   it('aceita um payload válido', () => {
+       6     const result = checkoutSchema.safeParse({
+       7       productId: 'case-iphone-15-silicone',
+       8       quantity: 2,
+       9     });
+      10     expect(result.success).toBe(true);
+     … +45 lines (ctrl+o to expand)
+
+● Write(apps\api\src\checkout\checkout.service.spec.ts)
+  ⎿  Wrote 71 lines to apps\api\src\checkout\checkout.service.spec.ts
+       1 import { describe, it, expect, beforeEach } from 'vitest';
+       2 import { ConflictException, NotFoundException } from '@nestjs/co
+         mmon';
+       4 import { ProductsService } from '../products/products.service.js
+         ';
+       5 
+       6 describe('CheckoutService', () => {
+       8   let checkoutService: CheckoutService;
+       9 
+      10   beforeEach(() => {
+     … +71 lines (ctrl+o to expand)
+
+● Agora o e2e spec:
+
+● Write(apps\api\test\app.e2e-spec.ts)
+  ⎿  Added 52 lines, removed 10 lines
+       1 +import { describe, it, expect, beforeEach, afterEach } from 'vi
+         +test';                                                         
+       2  import { Test, TestingModule } from '@nestjs/testing';
+       3  import { INestApplication } from '@nestjs/common';
+       4  import request from 'supertest';
+       4 -import { App } from 'supertest/types';                         
+       5 -import { AppModule } from './../src/app.module.js';            
+       5 +import type { App } from 'supertest/types';                    
+       6 +import { AppModule } from '../src/app.module.js';              
+       7  
+       7 -describe('AppController (e2e)', () => {                        
+       8 +describe('App (e2e)', () => {                                  
+       9    let app: INestApplication<App>;
+      10  
+      11    beforeEach(async () => {
+     ...
+      17      await app.init();
+      18    });
+      19  
+      19 -  it('/ (GET)', () => {                                        
+      20 -    return request(app.getHttpServer())                        
+      21 -      .get('/')                                                
+      22 -      .expect(200)                                             
+      23 -      .expect('Hello World!');                                 
+      24 -  });                                                          
+      25 -                                                               
+      20    afterEach(async () => {
+      21      await app.close();
+      22    });
+      23 +                                                               
+      24 +  it('GET /products devolve a lista de produtos', async () => {
+      25 +    const response = await request(app.getHttpServer())        
+      26 +      .get('/products')                                        
+      27 +      .expect(200);                                            
+      28 +                                                               
+      29 +    expect(Array.isArray(response.body)).toBe(true);           
+      30 +    expect(response.body.length).toBeGreaterThan(0);           
+      31 +    expect(response.body[0]).toHaveProperty('id');             
+      32 +    expect(response.body[0]).toHaveProperty('stock');          
+      33 +  });                                                          
+      34 +                                                               
+      35 +  it('POST /checkout com payload válido devolve 201', async () 
+         +=> {                                                           
+      36 +    const products = await request(app.getHttpServer()).get('/p
+         +roducts');                                                     
+      37 +    const product = products.body[0];                          
+      38 +                                                               
+      39 +    const response = await request(app.getHttpServer())        
+      40 +      .post('/checkout')                                       
+      41 +      .send({ productId: product.id, quantity: 1 })            
+      42 +      .expect(201);                                            
+      43 +                                                               
+      44 +    expect(response.body).toHaveProperty('orderId');           
+      45 +    expect(response.body.remainingStock).toBe(product.stock - 1
+         +);                                                             
+      46 +  });                                                          
+      47 +                                                               
+      48 +  it('POST /checkout com payload inválido devolve 400', async (
+         +) => {                                                         
+      49 +    await request(app.getHttpServer())                         
+      50 +      .post('/checkout')                                       
+      51 +      .send({ quantity: 0 })                                   
+      52 +      .expect(400);                                            
+      53 +  });                                                          
+      54 +                                                               
+      55 +  it('POST /checkout com estoque insuficiente devolve 409', asy
+         +nc () => {                                                     
+      56 +    const products = await request(app.getHttpServer()).get('/p
+         +roducts');                                                     
+      57 +    const outOfStock = products.body.find((p: { stock: number }
+         +) => p.stock === 0);                                           
+      58 +                                                               
+      59 +    await request(app.getHttpServer())                         
+      60 +      .post('/checkout')                                       
+      61 +      .send({ productId: outOfStock.id, quantity: 1 })         
+      62 +      .expect(409);                                            
+      63 +  });                                                          
+      64 +                                                               
+      65 +  it('POST /checkout com produto inexistente devolve 404', asyn
+         +c () => {                                                      
+      66 +    await request(app.getHttpServer())                         
+      67 +      .post('/checkout')                                       
+      68 +      .send({ productId: 'produto-inexistente', quantity: 1 }) 
+      69 +      .expect(404);                                            
+      70 +  });                                                          
+      71  });
+
+● Agora o front-end. Vou ver o package.json gerado do Vite e ajustar:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\web\package.json)
+  ⎿  Added 3 lines, removed 2 lines
+      1  {
+      2 -  "name": "web",                                                
+      2 +  "name": "@casecellshop/web",                                  
+      3    "private": true,
+      4    "version": "0.0.0",
+      5    "type": "module",
+     ...
+      11    },
+      12    "dependencies": {
+      13      "react": "^19.2.8",
+      14 -    "react-dom": "^19.2.8"                                     
+      14 +    "react-dom": "^19.2.8",                                    
+      15 +    "zod": "^3.24.1"                                           
+      16    },
+      17    "devDependencies": {
+      18      "@types/node": "^24.13.3",
+
+● Agora vamos ver os arquivos gerados do Vite pra decidir o que limpar:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(apps\web\index.html)
+  ⎿  Added 2 lines, removed 2 lines
+       1  <!doctype html>
+       2 -<html lang="en">                                               
+       2 +<html lang="pt-BR">                                            
+       3    <head>
+       4      <meta charset="UTF-8" />
+       5      <link rel="icon" type="image/svg+xml" href="/favicon.svg" /
+          >
+       6      <meta name="viewport" content="width=device-width, initial-
+          scale=1.0" />
+       7 -    <title>web</title>                                         
+       7 +    <title>CaseCellShop</title>                                
+       8    </head>
+       9    <body>
+      10      <div id="root"></div>
+
+● Write(apps\web\vite.config.ts)
+  ⎿  Added 9 lines
+       4  // https://vite.dev/config/
+       5  export default defineConfig({
+       6    plugins: [react()],
+       7 +  server: {                                                    
+       8 +    proxy: {                                                   
+       9 +      '/api': {                                                
+      10 +        target: 'http://localhost:3000',                       
+      11 +        changeOrigin: true,                                    
+      12 +        rewrite: (path) => path.replace(/^\/api/, ''),         
+      13 +      },                                                       
+      14 +    },                                                         
+      15 +  },                                                           
+      16  })
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(apps\web\src\index.css)
+  ⎿  Added 12 lines, removed 100 lines
+        1  :root {
+        2 -  --text: #6b6375;                                            
+        3 -  --text-h: #08060d;                                          
+        4 -  --bg: #fff;                                                 
+        5 -  --border: #e5e4e7;                                          
+        6 -  --code-bg: #f4f3ec;                                         
+        7 -  --accent: #aa3bff;                                          
+        8 -  --accent-bg: rgba(170, 59, 255, 0.1);                       
+        9 -  --accent-border: rgba(170, 59, 255, 0.5);                   
+       10 -  --social-bg: rgba(244, 243, 236, 0.5);                      
+       11 -  --shadow:                                                   
+       12 -    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0
+          - 4px 6px -2px;                                                
+       13 -                                                              
+       14 -  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;          
+       15 -  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;       
+       16 -  --mono: ui-monospace, Consolas, monospace;                  
+       17 -                                                              
+       18 -  font: 18px/145% var(--sans);                                
+       19 -  letter-spacing: 0.18px;                                     
+       20 -  color-scheme: light dark;                                   
+       21 -  color: var(--text);                                         
+       22 -  background: var(--bg);                                      
+       23 -  font-synthesis: none;                                       
+       24 -  text-rendering: optimizeLegibility;                         
+       25 -  -webkit-font-smoothing: antialiased;                        
+       26 -  -moz-osx-font-smoothing: grayscale;                         
+       27 -                                                              
+       28 -  @media (max-width: 1024px) {                                
+       29 -    font-size: 16px;                                          
+       30 -  }                                                           
+        2 +  color-scheme: light;                                        
+        3 +  font-family:                                                
+        4 +    system-ui,                                                
+        5 +    -apple-system,                                            
+        6 +    'Segoe UI',                                               
+        7 +    Roboto,                                                   
+        8 +    sans-serif;                                               
+        9  }
+       10  
+       33 -@media (prefers-color-scheme: dark) {                         
+       34 -  :root {                                                     
+       35 -    --text: #9ca3af;                                          
+       36 -    --text-h: #f3f4f6;                                        
+       37 -    --bg: #16171d;                                            
+       38 -    --border: #2e303a;                                        
+       39 -    --code-bg: #1f2028;                                       
+       40 -    --accent: #c084fc;                                        
+       41 -    --accent-bg: rgba(192, 132, 252, 0.15);                   
+       42 -    --accent-border: rgba(192, 132, 252, 0.5);                
+       43 -    --social-bg: rgba(47, 48, 58, 0.5);                       
+       44 -    --shadow:                                                 
+       45 -      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25)
+          - 0 4px 6px -2px;                                              
+       46 -  }                                                           
+       47 -                                                              
+       48 -  #social .button-icon {                                      
+       49 -    filter: invert(1) brightness(2);                          
+       50 -  }                                                           
+       51 -}                                                             
+       52 -                                                              
+       53 -#root {                                                       
+       54 -  width: 1126px;                                              
+       55 -  max-width: 100%;                                            
+       56 -  margin: 0 auto;                                             
+       57 -  text-align: center;                                         
+       58 -  border-inline: 1px solid var(--border);                     
+       59 -  min-height: 100svh;                                         
+       60 -  display: flex;                                              
+       61 -  flex-direction: column;                                     
+       11 +* {                                                           
+       12    box-sizing: border-box;
+       13  }
+       14  
+       15  body {
+       16    margin: 0;
+       17 +  background-color: #f5f5f7;                                  
+       18 +  color: #1d1d1f;                                             
+       19  }
+       20  
+       69 -h1,                                                           
+       70 -h2 {                                                          
+       71 -  font-family: var(--heading);                                
+       72 -  font-weight: 500;                                           
+       73 -  color: var(--text-h);                                       
+       21 +button {                                                      
+       22 +  font-family: inherit;                                       
+       23  }
+       75 -                                                              
+       76 -h1 {                                                          
+       77 -  font-size: 56px;                                            
+       78 -  letter-spacing: -1.68px;                                    
+       79 -  margin: 32px 0;                                             
+       80 -  @media (max-width: 1024px) {                                
+       81 -    font-size: 36px;                                          
+       82 -    margin: 20px 0;                                           
+       83 -  }                                                           
+       84 -}                                                             
+       85 -h2 {                                                          
+       86 -  font-size: 24px;                                            
+       87 -  line-height: 118%;                                          
+       88 -  letter-spacing: -0.24px;                                    
+       89 -  margin: 0 0 8px;                                            
+       90 -  @media (max-width: 1024px) {                                
+       91 -    font-size: 20px;                                          
+       92 -  }                                                           
+       93 -}                                                             
+       94 -p {                                                           
+       95 -  margin: 0;                                                  
+       96 -}                                                             
+       97 -                                                              
+       98 -code,                                                         
+       99 -.counter {                                                    
+      100 -  font-family: var(--mono);                                   
+      101 -  display: inline-flex;                                       
+      102 -  border-radius: 4px;                                         
+      103 -  color: var(--text-h);                                       
+      104 -}                                                             
+      105 -                                                              
+      106 -code {                                                        
+      107 -  font-size: 15px;                                            
+      108 -  line-height: 135%;                                          
+      109 -  padding: 4px 8px;                                           
+      110 -  background: var(--code-bg);                                 
+      111 -}                                                             
+
+● Agora os schemas/client da API compartilhados no front:
+
+● Write(apps\web\src\api\schemas.ts)
+  ⎿  Wrote 38 lines to apps\web\src\api\schemas.ts
+      1 import { z } from 'zod';
+      2 
+      3 export const productSchema = z.object({
+      4   id: z.string(),
+      5   name: z.string(),
+      6   model: z.string(),
+      7   priceCents: z.number().int().nonnegative(),
+      8   stock: z.number().int().nonnegative(),
+      9 });
+     … +29 lines (ctrl+o to expand)
+
+● Write(apps\web\src\api\client.ts)
+  ⎿  Wrote 47 lines to apps\web\src\api\client.ts
+       1 import {
+       2   checkoutResultSchema,
+       3   productListSchema,
+       4   type CheckoutResult,
+       5   type Product,
+       7 
+       8 export class ApiError extends Error {}
+       9 
+      10 async function parseErrorMessage(response: Response): Promise<st
+         ring> {
+     … +38 lines (ctrl+o to expand)
+
+● Agora o BuyForm.tsx — o coração da regra anti-duplo-envio:
+
+● Write(apps\web\src\components\BuyForm.module.css)
+  ⎿  Wrote 46 lines to apps\web\src\components\BuyForm.module.css
+       1 .form {
+       2   display: flex;
+       3   gap: 0.5rem;
+       4   align-items: flex-start;
+       5   margin-top: 0.75rem;
+       6 }
+       7 
+       8 .field {
+       9   display: flex;
+      10   flex-direction: column;
+     … +36 lines (ctrl+o to expand)
+
+● Write(apps\web\src\components\BuyForm.tsx)
+  ⎿  Wrote 75 lines to apps\web\src\components\BuyForm.tsx
+       1 import { useState, type FormEvent } from 'react';
+       2 import { z } from 'zod';
+       3 import { createQuantitySchema } from '../api/schemas';
+       4 import { postCheckout, ApiError } from '../api/client';
+       5 import type { CheckoutResult } from '../api/schemas';
+       6 import styles from './BuyForm.module.css';
+       7 
+       8 interface BuyFormProps {
+       9   productId: string;
+      10   stock: number;
+     … +70 lines (ctrl+o to expand)
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Removed 1 line
+      1  import { useState, type FormEvent } from 'react';
+      2 -import { z } from 'zod';                                        
+      2  import { createQuantitySchema } from '../api/schemas';
+      3  import { postCheckout, ApiError } from '../api/client';
+      4  import type { CheckoutResult } from '../api/schemas';
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Added 1 line, removed 1 line
+      30      const quantitySchema = createQuantitySchema(stock);
+      31      const parsed = quantitySchema.safeParse(Number(quantity));
+      32      if (!parsed.success) {
+      33 -      setFieldError(z.prettifyError(parsed.error).split('\n')[0
+         -]);                                                            
+      33 +      setFieldError(parsed.error.issues[0]?.message ?? 'Quantid
+         +ade inválida');                                                
+      34        return;
+      35      }
+      36      setFieldError(null);
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Update(apps\api\src\checkout\checkout.schema.ts)
+  ⎿  Added 2 lines, removed 4 lines
+       1  import { z } from 'zod';
+       2  
+       3  export const checkoutSchema = z.object({
+       4 -  productId: z                                                 
+       5 -    .string({ message: 'productId é obrigatório' })            
+       6 -    .min(1, 'productId é obrigatório'),                        
+       4 +  productId: z.string().min(1, 'productId é obrigatório'),     
+       5    quantity: z
+       8 -    .number({ message: 'quantity deve ser um número' })        
+       6 +    .number()                                                  
+       7      .int('quantity deve ser um número inteiro')
+       8      .positive('quantity deve ser maior que zero')
+       9      .max(999, 'quantity é maior do que o permitido'),
+
+● Update(apps\web\src\api\schemas.ts)
+  ⎿  Added 1 line, removed 1 line
+      31   */
+      32  export function createQuantitySchema(stock: number) {
+      33    return z
+      34 -    .number({ message: 'Informe uma quantidade válida' })      
+      34 +    .number()                                                  
+      35      .int('A quantidade deve ser um número inteiro')
+      36      .positive('A quantidade deve ser maior que zero')
+      37      .max(stock, 'Quantidade maior que o estoque disponível');
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Agora ProductCard:
+
+● Write(apps\web\src\components\ProductCard.module.css)
+  ⎿  Wrote 35 lines to apps\web\src\components\ProductCard.module.css
+      1 .card {
+      2   display: flex;
+      3   flex-direction: column;
+      4   gap: 0.35rem;
+      5   padding: 1rem;
+      6   border-radius: 10px;
+      7   background-color: #fff;
+      8   border: 1px solid #e5e5e8;
+      9 }
+     … +25 lines (ctrl+o to expand)
+
+● Write(apps\web\src\components\ProductCard.tsx)
+  ⎿  Wrote 43 lines to apps\web\src\components\ProductCard.tsx
+       1 import type { CheckoutResult, Product } from '../api/schemas';
+       2 import { BuyForm } from './BuyForm';
+       3 import styles from './ProductCard.module.css';
+       4 
+       5 const currencyFormatter = new Intl.NumberFormat('pt-BR', {
+       6   style: 'currency',
+       7   currency: 'BRL',
+       8 });
+       9 
+      10 interface ProductCardProps {
+     … +34 lines (ctrl+o to expand)
+
+● Agora App.tsx + estilos:
+
+● Write(apps\web\src\App.module.css)
+  ⎿  Wrote 43 lines to apps\web\src\App.module.css
+      1 .page {
+      2   max-width: 960px;
+      3   margin: 0 auto;
+      4   padding: 1.5rem 1rem 3rem;
+      5 }
+      6 
+      7 .title {
+      8   margin: 0 0 0.25rem;
+      9 }
+     … +33 lines (ctrl+o to expand)
+
+● Write(apps\web\src\App.tsx)
+  ⎿  Wrote 90 lines to apps\web\src\App.tsx
+       1 import { useEffect, useState } from 'react';
+       2 import { getProducts, ApiError } from './api/client';
+       3 import type { CheckoutResult, Product } from './api/schemas';
+       4 import { ProductCard } from './components/ProductCard';
+       5 import styles from './App.module.css';
+       7 type Banner = { type: 'success' | 'error'; message: string };
+       8 
+       9 function App() {
+      10   const [products, setProducts] = useState<Product[] | null>(nul
+         l);
+     … +83 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Vou instalar as dependências no monorepo:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Instalado com sucesso (só um warning de peer dependency do próprio scaffold do
+  Nest, inofensivo). Agora vamos rodar os testes do back-end:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 19 testes unitários passando. Agora o e2e:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Todos os 5 testes e2e passando também. Agora vou compilar o back-end e o
+  front-end para garantir que o TypeScript está limpo:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Build limpo. Agora o front-end:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Ambos compilam sem erros. Agora vamos fazer uma verificação end-to-end real:
+  subir a API e testar com curl, incluindo os cenários de erro do PRD.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● API rodando. Vamos testar os cenários do PRD via curl:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Vou testar concorrência (regra do estoque não pode ficar negativo com
+  requisições simultâneas):
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Exatamente 5 sucessos (201) e 5 falhas (409) de 10 requisições simultâneas,
+  estoque final em 0 — nunca negativo. A concorrência está protegida. Agora vou
+  parar a API e testar o front-end completo no navegador.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● A API já está rodando — vou deixá-la ativa e subir o front-end para o teste no
+  navegador.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Ambos servidores rodando. Vou abrir no navegador para testar visualmente o
+  fluxo completo.
+
+  Called claude-in-chrome 4 times (ctrl+o to expand)
+
+● Vou testar o fluxo de validação de front (quantidade > estoque) e depois uma
+  compra válida.
+
+  Called claude-in-chrome 3 times (ctrl+o to expand)
+
+● A tela recarregou o layout entre as capturas; vou refazer o teste com as
+  coordenadas atuais.
+
+  Read 1 file, called claude-in-chrome 7 times (ctrl+o to expand)
+
+● Update(apps\web\src\components\BuyForm.tsx)
+  ⎿  Added 1 line, removed 1 line
+      52    }
+      53  
+      54    return (
+      55 -    <form className={styles.form} onSubmit={handleSubmit}>     
+      55 +    <form className={styles.form} onSubmit={handleSubmit} noVal
+         +idate>                                                         
+      56        <div className={styles.field}>
+      57          <input
+      58            className={styles.input}
+  Called claude-in-chrome 4 times (ctrl+o to expand)
+
+● Client-side funcionando corretamente. Agora vou testar uma compra válida e
+  depois o anti-duplo-envio.
+
+  Called claude-in-chrome 5 times (ctrl+o to expand)
+
+● Compra funcionou perfeitamente (banner + estoque atualizado). Agora vou testar
+  o anti-duplo-envio com duplo-clique rápido:
+
+  Called claude-in-chrome (ctrl+o to expand)
+
+● Log limpo. Agora o duplo-clique:
+
+  Called claude-in-chrome 2 times (ctrl+o to expand)
+
+● Só 1 requisição saiu, mesmo com duplo-clique — a regra 3 está garantida. Vou
+  confirmar visualmente o estado final:
+
+  Called claude-in-chrome 2 times (ctrl+o to expand)
+
+● Fluxo completo validado. Vou encerrar os servidores de teste e a aba do
+  navegador.
+
+  Called claude-in-chrome, ran 2 shell commands (ctrl+o to expand)
+
+● Servidores parados. Agora vou rodar a suíte de testes uma última vez para
+  garantir que tudo está consistente após as edições:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Tudo passando (24 testes no total). Vou também rodar o build final dos dois
+  apps para confirmar que nada quebrou com o fix do noValidate:
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Projeto criado, testado e funcionando de ponta a ponta. Resumo:
+
+  O que foi feito
+
+  Estrutura: monorepo pnpm em CaseCellShop/ com apps/api (NestJS) e apps/web
+  (React + Vite + TS), atalhos --filter no package.json raiz (pnpm dev, pnpm 
+  test, pnpm build, etc.), git inicializado.
+
+  Back-end (apps/api):
+  - GET /products e POST /checkout (retorna 201 com pedido, 404 produto
+    inexistente, 409 estoque insuficiente, 400 payload inválido via Zod).
+  - ProductsService é o único dono do estoque — checagem e decremento no mesmo
+    bloco síncrono, o que evita overselling em requisições concorrentes (testei
+    com 10 requisições simultâneas contra estoque de 5: exatamente 5 sucessos, 5
+    falhas, estoque final 0, nunca negativo).
+  - 24 testes automatizados (unitários + e2e), todos passando.
+
+  Front-end (apps/web):
+  - Grade de produtos, formulário de quantidade validado com Zod (mensagens em
+    pt-BR), botão "Comprar" com trava de duplo-envio (isSubmitting, vira
+    "Comprando…", desabilita).
+  - Testado no navegador: compra válida, estoque insuficiente, produto esgotado,
+    e duplo-clique rápido gerando apenas 1 requisição.
+
+  Ajuste feito durante o teste: o Nest CLI atual gera projetos com Vitest em vez
+  de Jest por padrão — segui Vitest, mantendo a mesma cobertura planejada.
+  Também descobri e corrigi um bug real: o <input type="number" max={stock}> sem
+  noValidate fazia o navegador bloquear o submit silenciosamente via validação
+  HTML nativa antes do Zod rodar, escondendo a mensagem de erro em pt-BR.
+  Adicionado noValidate ao formulário.
+
+  Nada foi commitado ainda (só fiz git init) — quer que eu faça o commit inicial
+  agora?
+
+✻ Brewed for 17m 58s · done 6:57
+
+※ recap: Building the CaseCellShop starter monorepo (NestJS API + React front-end) from the PRD; scaffolding, code, and browser testing are done and everything works. Next: let me know if you want the initial git commit made. (disable recaps in /config)
+
+> /context 
+  ⎿  Context Usage
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛀ ⛁ ⛀ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   Sonnet 5
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-sonnet-5
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   153.8k/1m tokens (15%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ 
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 4.7k tokens (0.5%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 23k tokens (2.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP tools: 5.2k tokens (0.5%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 1k tokens (0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Skills: 10k tokens (1.0%)
+                                               ⛁ Messages: 110.5k tokens (11.1%)
+                                               ⛶ Free space: 812.6k (81.3%)
+                                               ⛝ Autocompact buffer: 33k tokens (3.3%)
+
+     Auto-compact window: 1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 258 tools · 5.2k tokens
+
+     Custom agents · .claude/agents/
+     └ 12 agents · 1k tokens
+
+     Skills · /skills
+     └ 120 skills · 10k tokens
+
+     /context all to expand
+
+> /export                                                                       
+  ⎿  Conversation copied to clipboard
