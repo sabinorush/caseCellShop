@@ -1,0 +1,1382 @@
+ ▐▛███▛█   Claude Code v2.1.273
+▝▜██████▀  Opus 5 · Claude Pro
+  ▝▝ ▝▝    ~\projects\CaseCellShop
+
+
+> /clear                                                                        
+
+> /plan                                                                         
+  ⎿  Enabled plan mode
+
+> precisamos aplicar algumas melhorias no projeto.                              
+                                                                                
+  Melhor @apps/api/src/main.ts tratativa de erro para caso .env nao esteja      
+  definido corretamente com um early return.                                    
+                                                                                
+  Preciso simular indisponibilidade da API e vamos tambem melhorar as mensagens 
+  de erro para quando a API estiver indisponivel.Em                             
+  @apps/web/src/api/client.ts vamos melhorar as trativas para os erros comuns   
+  de falha de servidor 502, 503, 504 e retornar uma mensagem mais amigavel.     
+  ⎿  Read apps\api\src\main.ts (13 lines)
+  ⎿  Read apps\web\src\api\client.ts (48 lines)
+
+● I'll explore the project structure to understand the current setup before
+  planning.
+
+● Explore(Explorar estrutura api e web)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● I'll wait for the exploration results.
+
+  Searched for 3 patterns, read 8 files (ctrl+o to expand)
+
+● User answered Claude's questions:
+  ⎿  · Quando o .env da API estiver ausente ou com valor inválido, o que o 
+     bootstrap deve fazer? → Falhar sempre (recomendado)
+     · Como simular a indisponibilidade da API para testar as novas mensagens? →
+     Proxy do Vite → 502/504 (recomendado)
+     · Devo cobrir as novas tratativas de erro do client.ts com testes 
+     automatizados? → Sim, adicionar Vitest ao web
+     · Além da mensagem, a UI deve ganhar um botão "Tentar novamente" quando a 
+     API estiver fora? → Sim, botão de retry (recomendado)
+
+● Agent "Explorar estrutura api e web" finished · 1m 52s
+
+● Good — full picture now. Let me verify one implementation detail about Vite's
+  proxy error handling before writing the plan.
+
+  Searched for 1 pattern, read 1 file, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● Verified the key detail: Vite 8 calls configure(proxy, opts) before
+  registering its own error handler (node.js:19380-19395), so a custom handler
+  runs first and controls the response. Writing the plan now.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: 
+     ~\.claude\plans\precisamos-aplicar-algumas-melhorias-moonlit-fountain.md · 
+     /plan to edit
+     Tratativa de erro de ambiente (API) e de indisponibilidade (Web)
+
+     Context
+
+     Hoje o projeto falha feio nos dois extremos do fluxo:
+
+     1. API — apps/api/src/main.ts:5 chama loadEnvFile('.env') no topo do
+        módulo, sem try/catch. Como só o .env.example é versionado, quem clona o
+        repo recebe um ENOENT com stack trace do Node e nenhuma pista do que
+        fazer. Além disso process.env.PORT ?? 3000 passa a string crua para
+        app.listen() — um PORT=abc só quebra lá na frente, com erro obscuro.
+     2. Web — apps/web/src/api/client.ts só cria ApiError quando !response.ok.
+        Falha de rede (fetch rejeita) e payload fora do schema escapam como
+        TypeError/ZodError e caem no fallback genérico de App.tsx/BuyForm.tsx.
+        Quando a API está fora, o proxy do Vite devolve 502 text/plain com corpo
+        vazio, então parseErrorMessage cai no default e o usuário lê "Erro 
+        inesperado (HTTP 502)" — sem explicação e sem saída.
+
+     Objetivo: a API falha cedo e com mensagem acionável quando o ambiente está
+     errado; o front distingue indisponibilidade do servidor de erro de negócio
+     e oferece "Tentar novamente".
+
+     Decisões confirmadas: falhar sempre quando o .env estiver ausente ou
+     inválido; simular a queda via handler de erro no proxy do Vite (502/504);
+     adicionar Vitest ao apps/web para cobrir o client.ts; incluir botão de
+     retry na UI.
+
+     ---
+
+     1. API — validação de ambiente com early return
+
+     Novo: apps/api/src/config/env.ts
+
+     Usa o zod v4 que já é dependência da API (mesmo padrão do
+     checkout.schema.ts); não instalar @nestjs/config.
+
+     Duas funções, para manter a parte validável pura e testável sem mexer em
+     process.env:
+
+     const envSchema = z.object({
+       PORT: z.coerce.number().int().min(1).max(65535),
+     });
+
+     export type Env = z.infer<typeof envSchema>;
+     export type EnvResult = { ok: true; env: Env } | { ok: false; message:
+     string };
+
+     export function parseEnv(source: NodeJS.ProcessEnv): EnvResult   // pura
+     export function loadEnv(file = '.env'): EnvResult                // 
+     loadEnvFile + parseEnv(process.env)
+
+     - loadEnv envolve loadEnvFile(file) em try/catch; no ENOENT devolve { ok: 
+       false } com mensagem citando o caminho absoluto (resolve(process.cwd(), 
+       file)) e instruindo cp .env.example .env.
+     - parseEnv monta a mensagem a partir de result.error.issues, mapeando
+       path/message como já faz apps/api/src/common/zod-validation.pipe.ts — uma
+       linha por variável inválida.
+     - PORT é obrigatório (sem default): z.coerce.number() sobre undefined vira
+       NaN e falha, que é o comportamento "falhar sempre" escolhido.
+
+     apps/api/src/main.ts
+
+     Remove o loadEnvFile de topo de módulo e move tudo para dentro do
+     bootstrap:
+
+     async function bootstrap() {
+       const result = loadEnv();
+       if (!result.ok) {
+         console.error(result.message);
+         process.exitCode = 1;
+         return;                       // early return: nada é inicializado
+       }
+
+       const app = await NestFactory.create(AppModule);
+       app.enableCors();
+       await app.listen(result.env.PORT);
+       console.log(`API ouvindo em http://localhost:${result.env.PORT}`);
+     }
+
+     process.exitCode = 1 + return em vez de process.exit(1) — deixa o stdout
+     esvaziar antes de sair.
+
+     Envolver o trecho pós-validação em try/catch para traduzir EADDRINUSE ("A
+     porta X já está em uso") no mesmo formato, evitando o único outro stack
+     trace comum no boot.
+
+     Novo: apps/api/src/config/env.spec.ts
+
+     Vitest, no padrão dos specs existentes: parseEnv({ PORT: '3000' }) → ok;
+     PORT ausente, 'abc', '0' e '70000' → ok: false com a variável citada na
+     mensagem; loadEnv('.env.inexistente') → ok: false mencionando o caminho.
+
+     ---
+
+     2. Web — proxy do Vite devolvendo 502/504 reais
+
+     apps/web/vite.config.ts
+
+     a) Validar API_URL. Hoje, se estiver ausente, target vira undefined e o
+     Vite estoura com erro interno. Validar com zod (z.url()) e lançar Error com
+     mensagem em pt-BR apontando o .env.example.
+
+     b) Handler de erro no proxy. Verifiquei o Vite 8.3.0 instalado
+     (dist/node/chunks/node.js:19380-19395): opts.configure(proxy, opts) roda
+     antes do handler interno do Vite, e o interno só escreve se
+     !res.headersSent. Ou seja, o nosso handler ganha a resposta:
+
+     configure: (proxy) => {
+       proxy.on('error', (err: NodeJS.ErrnoException, _req, res) => {
+         if (!('req' in res)) { res.destroy(); return; }          // upgrade de 
+     websocket
+         if (res.headersSent || res.writableEnded) { res.end(); return; }
+         const status = TIMEOUT_CODES.has(err.code ?? '') ? 504 : 502;
+         res.writeHead(status, { 'Content-Type': 'application/json; 
+     charset=utf-8' });
+         res.end(JSON.stringify({ statusCode: status, message: 'API 
+     indisponível' }));
+       });
+     },
+     timeout: 10_000,
+     proxyTimeout: 10_000,
+
+     Mapeamento: ECONNREFUSED / ENOTFOUND / EHOSTUNREACH / EAI_AGAIN → 502 (API
+     não está no ar); ETIMEDOUT / ECONNRESET / ECONNABORTED → 504. O ECONNRESET
+     entra em 504 porque proxyTimeout é implementado como proxyReq.destroy()
+     (node.js:18745), que emite exatamente esse código.
+
+     Ganho duplo: derrubar a API passa a produzir um 502 com corpo JSON (em vez
+     de 502 text/plain vazio), e o dev passa a espelhar o que um reverse proxy
+     faria em produção.
+
+     ---
+
+     3. Web — apps/web/src/api/client.ts
+
+     Reescrever em torno de um helper request() compartilhado, eliminando a
+     duplicação entre getProducts e postCheckout. Assinaturas públicas de 
+     getProducts/postCheckout ficam iguais — App.tsx e BuyForm.tsx continuam
+     compilando.
+
+     ApiError com contexto
+
+     export type ApiErrorKind = 'network' | 'timeout' | 'unavailable' | 'http' |
+     'invalid-response';
+
+     export class ApiError extends Error {
+       readonly kind: ApiErrorKind;
+       readonly status?: number;
+       readonly issues?: { path: string; message: string }[];
+       readonly retryable: boolean;   // true para network | timeout | 
+     unavailable | 5xx
+     }
+
+     issues aproveita o array que zod-validation.pipe.ts já devolve no 400 e que
+     hoje é descartado.
+
+     Mensagens (const MESSAGES, topo do arquivo, pt-BR)
+
+     ┌──────────────────────────┬──────────────────────────────────────────────┐
+     │         Situação         │                   Mensagem                   │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ 502 / 503 / 504          │ "Estamos com instabilidade no servidor.      │
+     │                          │ Tente novamente em alguns instantes."        │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ Demais 5xx               │ "Ocorreu um erro no servidor. Tente          │
+     │                          │ novamente em alguns instantes."              │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ fetch rejeitou           │ "Não foi possível conectar ao servidor.      │
+     │ (API/proxy fora,         │ Verifique sua conexão e tente novamente."    │
+     │ offline)                 │                                              │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ Timeout do cliente       │ "O servidor demorou para responder. Tente    │
+     │                          │ novamente."                                  │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ Corpo não-JSON ou fora   │ "Recebemos uma resposta inesperada do        │
+     │ do schema                │ servidor."                                   │
+     ├──────────────────────────┼──────────────────────────────────────────────┤
+     │ 4xx                      │ mensagem do próprio back (já em pt-BR:       │
+     │                          │ 404/409/400)                                 │
+     └──────────────────────────┴──────────────────────────────────────────────┘
+
+     request<T>(path, schema, init?)
+
+     1. fetch com signal: AbortSignal.timeout(8_000), dentro de try/catch.
+        No catch: DOMException com name === 'TimeoutError' → kind: 'timeout';
+        qualquer outra rejeição → kind: 'network'. O erro original vai em cause.
+     2. !response.ok → toHttpError(response):
+        - 502/503/504 não leem o corpo — corpo de gateway costuma ser
+          HTML/vazio; usa a mensagem amigável direto, com status preservado.
+        - Outros 5xx → mensagem genérica de servidor.
+        - 4xx → reaproveita a leitura tolerante do parseErrorMessage atual (try 
+          { response.json() } catch {}), aceitando message: string e message: 
+          string[] (formato padrão do Nest, hoje ignorado), e capturando issues.
+     3. response.json() e schema.safeParse() com falha → kind: 
+        'invalid-response' (hoje o ZodError vaza cru).
+
+     ---
+
+     4. Web — retry na UI (apps/web/src/App.tsx)
+
+     - Extrair o corpo do useEffect para loadProducts() (useCallback), mantendo
+       a guarda cancelled.
+     - loadError passa a guardar { message, retryable }; quando retryable,
+       renderizar ao lado da mensagem um botão "Tentar novamente" que chama
+       loadProducts(), desabilitado enquanto recarrega (isRetrying).
+     - Adicionar role="alert" ao banner de erro — ele já existe em
+       App.module.css:29 e hoje não é anunciado por leitores de tela.
+     - Novo estilo .retryButton em apps/web/src/App.module.css, no padrão do
+       .button de BuyForm.module.css.
+
+     BuyForm.tsx não muda: já repassa error.message via onError, e passa a
+     exibir a mensagem amigável automaticamente.
+
+     ---
+
+     5. Testes do front (apps/web)
+
+     - devDependencies: vitest (^4.1.2, mesma versão da API). Não precisa de
+       jsdom/testing-library — client.ts só usa fetch.
+     - apps/web/vitest.config.ts próprio (environment: 'node', include: 
+       ['src/**/*.test.ts']). Isso é necessário, não cosmético: sem ele o Vitest
+       carregaria o vite.config.ts, que agora lança quando API_URL não está
+       definida.
+     - apps/web/src/api/client.test.ts com globalThis.fetch stubado por vi.fn():
+       - 502, 503 e 504 → mensagem de instabilidade, kind: 'unavailable', status
+         preservado, retryable: true;
+       - 502 com corpo HTML → ainda a mensagem amigável (nunca HTML na tela);
+       - fetch rejeita TypeError → mensagem de conexão;
+       - fetch rejeita DOMException('','TimeoutError') → mensagem de timeout;
+       - 409 e 404 → mensagem do back preservada, retryable: false;
+       - 400 com { message, issues } → issues expostos no erro;
+       - 200 com payload fora do schema → invalid-response;
+       - caminho feliz de getProducts e postCheckout (inclusive body/headers do
+         POST).
+     - apps/web/package.json: "test": "vitest run".
+     - package.json raiz: "test": "pnpm -r test" e novo "test:web" (hoje test
+       está fixo no filtro da API).
+
+     ---
+
+     Arquivos
+
+     Novos: apps/api/src/config/env.ts, apps/api/src/config/env.spec.ts,
+     apps/web/vitest.config.ts, apps/web/src/api/client.test.ts
+     Alterados: apps/api/src/main.ts, apps/web/vite.config.ts,
+     apps/web/src/api/client.ts, apps/web/src/App.tsx,
+     apps/web/src/App.module.css, apps/web/package.json, package.json (raiz)
+
+     Fora de escopo (identificados, não incluídos): filtro de exceção global no
+     Nest, pacote compartilhado de schemas entre os apps, módulo central de
+     strings pt-BR.
+
+     ---
+
+     Verificação
+
+     API
+     1. pnpm test:api — suíte existente + env.spec.ts passando.
+     2. Renomear apps/api/.env → rodar pnpm dev:api: mensagem em pt-BR citando o
+        caminho absoluto e o .env.example, sem stack trace; conferir
+        $LASTEXITCODE = 1.
+     3. .env com PORT=abc → mensagem apontando PORT; com PORT=3000 → sobe
+        normalmente e loga a URL. Restaurar o .env.
+
+     Web
+     4. pnpm --filter @casecellshop/web test — todos os casos do client.test.ts
+     passando.
+     5. Com a API desligada, pnpm dev:web e abrir http://localhost:5173: banner
+     "Estamos com instabilidade no servidor…" + botão "Tentar novamente"; na aba
+     Network, /api/products = 502 com corpo JSON.
+     6. Subir a API e clicar em "Tentar novamente" → a grade carrega sem
+     recarregar a página.
+     7. Com a página carregada, derrubar a API e clicar em "Comprar" → banner de
+     indisponibilidade (não "Erro inesperado (HTTP 502)"), botão volta de
+     "Comprando…" para "Comprar".
+     8. Regressão dos erros de negócio: API no ar, comprar acima do estoque →
+     continua exibindo a mensagem de estoque insuficiente vinda do back.
+
+     Geral
+     9. pnpm build e pnpm lint limpos nos dois apps.
+
+● Now implementing. Starting with the API env validation.
+
+  Read 1 file (ctrl+o to expand)
+
+● This confirms the zod v4 usage pattern. Now let's create the env config
+  module.
+
+● Write(apps\api\src\config\env.ts)
+  ⎿  Wrote 58 lines to apps\api\src\config\env.ts
+      1 import { loadEnvFile } from 'node:process';
+      2 import { resolve } from 'node:path';
+      3 import { z } from 'zod';
+      4 
+      5 const envSchema = z.object({
+         ser um número inteiro').min(1, 'PORT deve estar entre 1 e 65535'
+        ).max(65535, 'PORT deve estar entre 1 e 65535'),
+      7 });
+      8 
+      9 export type Env = z.infer<typeof envSchema>;
+     … +60 lines (ctrl+o to expand)
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Good — my env.ts code with z.coerce.number('PORT deve ser um número') is valid
+  syntax. Let me verify the full envSchema behaves as expected end-to-end.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The schema works correctly. Now update main.ts:
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(apps\api\src\main.ts)
+  ⎿  Added 23 lines, removed 6 lines
+       1 -import { loadEnvFile } from 'node:process';                    
+       1  import { NestFactory } from '@nestjs/core';
+       2  import { AppModule } from './app.module.js';
+       3 +import { loadEnv } from './config/env.js';                     
+       4  
+       5 -loadEnvFile('.env');                                           
+       6 -                                                               
+       5  async function bootstrap() {
+       8 -  const app = await NestFactory.create(AppModule);             
+       9 -  app.enableCors();                                            
+      10 -  await app.listen(process.env.PORT ?? 3000);                  
+       6 +  const envResult = loadEnv();                                 
+       7 +  if (!envResult.ok) {                                         
+       8 +    console.error(envResult.message);                          
+       9 +    process.exitCode = 1;                                      
+      10 +    return;                                                    
+      11 +  }                                                            
+      12 +  const { env } = envResult;                                   
+      13 +                                                               
+      14 +  try {                                                        
+      15 +    const app = await NestFactory.create(AppModule);           
+      16 +    app.enableCors();                                          
+      17 +    await app.listen(env.PORT);                                
+      18 +    console.log(`API ouvindo em http://localhost:${env.PORT}`);
+      19 +  } catch (error) {                                            
+      20 +    const code = (error as NodeJS.ErrnoException)?.code;       
+      21 +    if (code === 'EADDRINUSE') {                               
+      22 +      console.error(`A porta ${env.PORT} já está em uso. Encerr
+         +e o processo que a está usando ou defina outra PORT no .env.`);
+      23 +    } else {                                                   
+      24 +      console.error('Falha ao iniciar a API:', error);         
+      25 +    }                                                          
+      26 +    process.exitCode = 1;                                      
+      27 +  }                                                            
+      28  }
+      29  await bootstrap();
+
+● Now the env spec test:
+
+  Read 1 file (ctrl+o to expand)
+
+● Good, this gives me the test style pattern (describe/it/expect from vitest, no
+  beforeEach globals needed since globals: true). Now write env.spec.ts:
+● Write(apps\api\src\config\env.spec.ts)
+  ⎿  Wrote 48 lines to apps\api\src\config\env.spec.ts
+      1 import { describe, it, expect } from 'vitest';
+      2 import { parseEnv, loadEnv } from './env.js';
+      3 
+      4 describe('parseEnv', () => {
+      5   it('aceita um PORT numérico válido', () => {
+      6     const result = parseEnv({ PORT: '3000' } as NodeJS.ProcessEnv
+        );
+      7     expect(result.ok).toBe(true);
+      8     expect(result.ok && result.env.PORT).toBe(3000);
+      9   });
+     … +40 lines (ctrl+o to expand)
+
+● Now let's run the API tests:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 26 tests pass (24 existing + our new env tests... wait, 6 new tests were
+  added but only 2 more than 24 shows 26 — let me check e2e too, and verify
+  build/manual boot).
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Good. Now let's manually verify the early-return behavior for missing/invalid
+  .env:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Clean message, no stack trace, exit code 1. Now test invalid PORT:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now test valid PORT and restore:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● API boots normally and logs the URL. API side fully verified. Let's clean up
+  the dist build artifact (not tracked, fine) and move to the web side.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Good, dist/ isn't tracked. Now to the web side — update vite.config.ts:
+
+  Searched for 4 patterns, read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● Write(apps\web\vite.config.ts)
+  ⎿  Added 42 lines, removed 1 line
+       1 +import { ServerResponse } from "node:http";                    
+       2  import react from "@vitejs/plugin-react";
+       3  import { defineConfig, loadEnv } from "vite";
+       4 +import { z } from "zod";                                       
+       5  
+       6 +// Códigos de erro de socket que indicam "servidor não responde
+         +u a tempo",                                                    
+       7 +// em vez de "servidor não está no ar" — viram 504 em vez de 50
+         +2.                                                             
+       8 +const TIMEOUT_ERROR_CODES = new Set(["ETIMEDOUT", "ECONNRESET",
+         + "ECONNABORTED"]);                                             
+       9 +                                                               
+      10  export default defineConfig(({ mode }) => {
+      11    const env = loadEnv(mode, process.cwd(), "");
+      12  
+      13 +  const apiUrlResult = z                                       
+      14 +    .string({ error: "API_URL não está definida" })            
+      15 +    .url("API_URL deve ser uma URL válida")                    
+      16 +    .safeParse(env.API_URL);                                   
+      17 +  if (!apiUrlResult.success) {                                 
+      18 +    throw new Error(                                           
+      19 +      `Configuração inválida em apps/web/.env: ${apiUrlResult.e
+         +rror.issues[0]?.message}.\n` +                                 
+      20 +        "Verifique o arquivo .env (veja .env.example para os va
+         +lores esperados).",                                            
+      21 +    );                                                         
+      22 +  }                                                            
+      23 +  const apiUrl = apiUrlResult.data;                            
+      24 +                                                               
+      25    return {
+      26      plugins: [react()],
+      27      server: {
+      28        proxy: {
+      29          "/api": {
+      12 -          target: env.API_URL,                                 
+      30 +          target: apiUrl,                                      
+      31            changeOrigin: true,
+      32            rewrite: (path) => path.replace(/^\/api/, ""),
+      33 +          timeout: 10_000,                                     
+      34 +          proxyTimeout: 10_000,                                
+      35 +          // Simula, em dev, o que um reverse proxy de produção
+         + devolveria                                                    
+      36 +          // quando a API está indisponível: 502 (fora do ar) o
+         +u 504                                                          
+      37 +          // (não respondeu a tempo), sempre com um corpo JSON 
+         +— em vez do                                                    
+      38 +          // 502 text/plain vazio que o Vite devolve por padrão
+         +.                                                              
+      39 +          configure: (proxy) => {                              
+      40 +            proxy.on("error", (err, _req, res) => {            
+      41 +              if (!(res instanceof ServerResponse)) {          
+      42 +                // Erro numa conexão de websocket: não há respo
+         +sta HTTP a montar.                                             
+      43 +                res.destroy();                                 
+      44 +                return;                                        
+      45 +              }                                                
+      46 +              if (res.headersSent || res.writableEnded) {      
+      47 +                res.end();                                     
+      48 +                return;                                        
+      49 +              }                                                
+      50 +              const code = (err as NodeJS.ErrnoException).code 
+         +?? "";                                                         
+      51 +              const status = TIMEOUT_ERROR_CODES.has(code) ? 50
+         +4 : 502;                                                       
+      52 +              res.writeHead(status, { "Content-Type": "applicat
+         +ion/json; charset=utf-8" });                                   
+      53 +              res.end(JSON.stringify({ statusCode: status, mess
+         +age: "API indisponível" }));                                   
+      54 +            });                                                
+      55 +          },                                                   
+      56          },
+      57        },
+      58      },
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let's rewrite client.ts:
+
+  Read 3 files (ctrl+o to expand)
+
+● Write(apps\web\src\api\client.ts)
+  ⎿  Added 107 lines, removed 22 lines
+      1 +import type { ZodType } from 'zod';                             
+      2  import {
+      3    checkoutResultSchema,
+      4    productListSchema,
+     ...
+        6    type Product,
+        7  } from './schemas';
+        8  
+        8 -export class ApiError extends Error {}                        
+        9 +export type ApiErrorKind = 'network' | 'timeout' | 'unavailabl
+          +e' | 'http' | 'invalid-response';                             
+       10  
+       10 -async function parseErrorMessage(response: Response): Promise<
+          -string> {                                                     
+       11 +export interface ApiErrorIssue {                              
+       12 +  path: string;                                               
+       13 +  message: string;                                            
+       14 +}                                                             
+       15 +                                                              
+       16 +interface ApiErrorOptions {                                   
+       17 +  kind: ApiErrorKind;                                         
+       18 +  status?: number;                                            
+       19 +  issues?: ApiErrorIssue[];                                   
+       20 +  cause?: unknown;                                            
+       21 +}                                                             
+       22 +                                                              
+       23 +export class ApiError extends Error {                         
+       24 +  readonly kind: ApiErrorKind;                                
+       25 +  readonly status?: number;                                   
+       26 +  readonly issues?: ApiErrorIssue[];                          
+       27 +  /** true quando faz sentido a UI oferecer "tentar novamente"
+          +. */                                                          
+       28 +  readonly retryable: boolean;                                
+       29 +                                                              
+       30 +  constructor(message: string, options: ApiErrorOptions) {    
+       31 +    super(message, options.cause !== undefined ? { cause: opti
+          +ons.cause } : undefined);                                     
+       32 +    this.name = 'ApiError';                                   
+       33 +    this.kind = options.kind;                                 
+       34 +    this.status = options.status;                             
+       35 +    this.issues = options.issues;                             
+       36 +    this.retryable =                                          
+       37 +      options.kind === 'network' ||                           
+       38 +      options.kind === 'timeout' ||                           
+       39 +      options.kind === 'unavailable' ||                       
+       40 +      (options.kind === 'http' && (options.status ?? 0) >= 500
+          +);                                                            
+       41 +  }                                                           
+       42 +}                                                             
+       43 +                                                              
+       44 +const MESSAGES = {                                            
+       45 +  unavailable: 'Estamos com instabilidade no servidor. Tente n
+          +ovamente em alguns instantes.',                               
+       46 +  serverError: 'Ocorreu um erro no servidor. Tente novamente e
+          +m alguns instantes.',                                         
+       47 +  network: 'Não foi possível conectar ao servidor. Verifique s
+          +ua conexão e tente novamente.',                               
+       48 +  timeout: 'O servidor demorou para responder. Tente novamente
+          +.',                                                           
+       49 +  invalidResponse: 'Recebemos uma resposta inesperada do servi
+          +dor.',                                                        
+       50 +} as const;                                                   
+       51 +                                                              
+       52 +const REQUEST_TIMEOUT_MS = 8_000;                             
+       53 +                                                              
+       54 +// 502/503/504: erros de gateway/proxy. O corpo (quando existe
+          +) costuma ser                                                 
+       55 +// HTML ou texto sem relação com a API, então nem tentamos lê-
+          +lo.                                                           
+       56 +const GATEWAY_STATUS_CODES = new Set([502, 503, 504]);        
+       57 +                                                              
+       58 +async function toHttpError(response: Response): Promise<ApiErr
+          +or> {                                                         
+       59 +  if (GATEWAY_STATUS_CODES.has(response.status)) {            
+       60 +    return new ApiError(MESSAGES.unavailable, { kind: 'unavail
+          +able', status: response.status });                            
+       61 +  }                                                           
+       62 +  if (response.status >= 500) {                               
+       63 +    return new ApiError(MESSAGES.serverError, { kind: 'http', 
+          +status: response.status });                                   
+       64 +  }                                                           
+       65 +                                                              
+       66    try {
+       67      const body = await response.json();
+       13 -    if (typeof body?.message === 'string') {                  
+       14 -      return body.message;                                    
+       68 +    // O back devolve `message` como string (404/409) ou array
+          + (400 padrão                                                  
+       69 +    // do Nest); `issues` só existe no 400 do ZodValidationPip
+          +e.                                                            
+       70 +    const message = Array.isArray(body?.message)              
+       71 +      ? body.message[0]                                       
+       72 +      : typeof body?.message === 'string'                     
+       73 +        ? body.message                                        
+       74 +        : undefined;                                          
+       75 +    const issues: ApiErrorIssue[] | undefined = Array.isArray(
+          +body?.issues)                                                 
+       76 +      ? body.issues                                           
+       77 +      : undefined;                                            
+       78 +    if (typeof message === 'string') {                        
+       79 +      return new ApiError(message, { kind: 'http', status: res
+          +ponse.status, issues });                                      
+       80      }
+       81    } catch {
+       82      // resposta sem corpo JSON legível
+       83    }
+       19 -  return `Erro inesperado (HTTP ${response.status})`;         
+       84 +  return new ApiError(`Erro inesperado (HTTP ${response.status
+          +})`, {                                                        
+       85 +    kind: 'http',                                             
+       86 +    status: response.status,                                  
+       87 +  });                                                         
+       88  }
+       89  
+       22 -export async function getProducts(): Promise<Product[]> {     
+       23 -  const response = await fetch('/api/products');              
+       90 +async function request<T>(path: string, schema: ZodType<T>, in
+          +it?: RequestInit): Promise<T> {                               
+       91 +  let response: Response;                                     
+       92 +  try {                                                       
+       93 +    response = await fetch(path, { ...init, signal: AbortSigna
+          +l.timeout(REQUEST_TIMEOUT_MS) });                             
+       94 +  } catch (error) {                                           
+       95 +    if (error instanceof DOMException && error.name === 'Timeo
+          +utError') {                                                   
+       96 +      throw new ApiError(MESSAGES.timeout, { kind: 'timeout', 
+          +cause: error });                                              
+       97 +    }                                                         
+       98 +    throw new ApiError(MESSAGES.network, { kind: 'network', ca
+          +use: error });                                                
+       99 +  }                                                           
+      100 +                                                              
+      101    if (!response.ok) {
+       25 -    throw new ApiError(await parseErrorMessage(response));    
+      102 +    throw await toHttpError(response);                        
+      103    }
+       27 -  const data = await response.json();                         
+       28 -  return productListSchema.parse(data);                       
+      104 +                                                              
+      105 +  let data: unknown;                                          
+      106 +  try {                                                       
+      107 +    data = await response.json();                             
+      108 +  } catch (error) {                                           
+      109 +    throw new ApiError(MESSAGES.invalidResponse, { kind: 'inva
+          +lid-response', cause: error });                               
+      110 +  }                                                           
+      111 +                                                              
+      112 +  const parsed = schema.safeParse(data);                      
+      113 +  if (!parsed.success) {                                      
+      114 +    throw new ApiError(MESSAGES.invalidResponse, {            
+      115 +      kind: 'invalid-response',                               
+      116 +      cause: parsed.error,                                    
+      117 +    });                                                       
+      118 +  }                                                           
+      119 +  return parsed.data;                                         
+      120  }
+      121  
+       31 -export async function postCheckout(                           
+       32 -  productId: string,                                          
+       33 -  quantity: number,                                           
+       34 -): Promise<CheckoutResult> {                                  
+       35 -  const response = await fetch('/api/checkout', {             
+      122 +export function getProducts(): Promise<Product[]> {           
+      123 +  return request('/api/products', productListSchema);         
+      124 +}                                                             
+      125 +                                                              
+      126 +export function postCheckout(productId: string, quantity: numb
+          +er): Promise<CheckoutResult> {                                
+      127 +  return request('/api/checkout', checkoutResultSchema, {     
+      128      method: 'POST',
+      129      headers: { 'Content-Type': 'application/json' },
+      130      body: JSON.stringify({ productId, quantity }),
+      131    });
+       40 -                                                              
+       41 -  if (!response.ok) {                                         
+       42 -    throw new ApiError(await parseErrorMessage(response));    
+       43 -  }                                                           
+       44 -                                                              
+       45 -  const data = await response.json();                         
+       46 -  return checkoutResultSchema.parse(data);                    
+      132  }
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Confirmed — fetch rejects with a DOMException named TimeoutError exactly as
+  the client code expects. Now let's verify plain network failure (connection
+  refused) rejection shape:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Good — TypeError, matching the network fallback branch. Now let's write the
+  App.tsx retry UI changes.
+
+  Read 2 files (ctrl+o to expand)
+
+● Now let's update App.tsx and App.module.css:
+
+● Update(apps\web\src\App.module.css)
+  ⎿  Added 20 lines
+      30    background-color: #fdecea;
+      31    color: #a02f24;
+      32    border: 1px solid #f3c2bd;
+      33 +  display: flex;                                               
+      34 +  align-items: center;                                         
+      35 +  gap: 0.75rem;                                                
+      36 +  flex-wrap: wrap;                                             
+      37  }
+      38  
+      39 +.retryButton {                                                 
+      40 +  padding: 0.35rem 0.85rem;                                    
+      41 +  border: 1px solid #a02f24;                                   
+      42 +  border-radius: 6px;                                          
+      43 +  background-color: transparent;                               
+      44 +  color: #a02f24;                                              
+      45 +  font-size: 0.85rem;                                          
+      46 +  cursor: pointer;                                             
+      47 +  white-space: nowrap;                                         
+      48 +}                                                              
+      49 +                                                               
+      50 +.retryButton:disabled {                                        
+      51 +  opacity: 0.6;                                                
+      52 +  cursor: not-allowed;                                         
+      53 +}                                                              
+      54 +                                                               
+      55  .grid {
+      56    display: grid;
+      57    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+
+● Write(apps\web\src\App.tsx)
+  ⎿  Added 52 lines, removed 16 lines
+       1 -import { useEffect, useState } from 'react';                   
+       1 +import { useCallback, useEffect, useState } from 'react';      
+       2  import { getProducts, ApiError } from './api/client';
+       3  import type { CheckoutResult, Product } from './api/schemas';
+       4  import { ProductCard } from './components/ProductCard';
+       5  import styles from './App.module.css';
+       6  
+       7  type Banner = { type: 'success' | 'error'; message: string };
+       8 +type LoadError = { message: string; retryable: boolean };      
+       9  
+      10  function App() {
+      11    const [products, setProducts] = useState<Product[] | null>(nu
+          ll);
+      11 -  const [loadError, setLoadError] = useState<string | null>(nul
+         -l);                                                            
+      12 +  const [loadError, setLoadError] = useState<LoadError | null>(
+         +null);                                                         
+      13 +  const [isRetrying, setIsRetrying] = useState(false);         
+      14    const [banner, setBanner] = useState<Banner | null>(null);
+      15  
+      14 -  useEffect(() => {                                            
+      16 +  const loadProducts = useCallback(async () => {               
+      17      let cancelled = false;
+      18  
+      17 -    getProducts()                                              
+      18 -      .then((data) => {                                        
+      19 -        if (!cancelled) setProducts(data);                     
+      20 -      })                                                       
+      21 -      .catch((error: unknown) => {                             
+      22 -        if (cancelled) return;                                 
+      23 -        setLoadError(                                          
+      24 -          error instanceof ApiError                            
+      25 -            ? error.message                                    
+      26 -            : 'Não foi possível carregar os produtos.',        
+      27 -        );                                                     
+      28 -      });                                                      
+      19 +    try {                                                      
+      20 +      const data = await getProducts();                        
+      21 +      if (!cancelled) {                                        
+      22 +        setProducts(data);                                     
+      23 +        setLoadError(null);                                    
+      24 +      }                                                        
+      25 +    } catch (error: unknown) {                                 
+      26 +      if (cancelled) return;                                   
+      27 +      setLoadError(                                            
+      28 +        error instanceof ApiError                              
+      29 +          ? { message: error.message, retryable: error.retryabl
+         +e }                                                            
+      30 +          : { message: 'Não foi possível carregar os produtos.'
+         +, retryable: true },                                           
+      31 +      );                                                       
+      32 +    }                                                          
+      33  
+      34      return () => {
+      35        cancelled = true;
+      36      };
+      37    }, []);
+      38  
+      39 +  useEffect(() => {                                            
+      40 +    let cleanup: (() => void) | undefined;                     
+      41 +    loadProducts().then((fn) => {                              
+      42 +      cleanup = fn;                                            
+      43 +    });                                                        
+      44 +    return () => cleanup?.();                                  
+      45 +  }, [loadProducts]);                                          
+      46 +                                                               
+      47 +  async function handleRetry() {                               
+      48 +    setIsRetrying(true);                                       
+      49 +    try {                                                      
+      50 +      await loadProducts();                                    
+      51 +    } finally {                                                
+      52 +      setIsRetrying(false);                                    
+      53 +    }                                                          
+      54 +  }                                                            
+      55 +                                                               
+      56    function handlePurchaseSuccess(result: CheckoutResult) {
+      57      setProducts(
+      58        (current) =>
+     ...
+      79  
+      80        {banner && (
+      81          <p
+      82 +          role="alert"                                         
+      83            className={`${styles.banner} ${
+      84              banner.type === 'success' ? styles.bannerSuccess : 
+          styles.bannerError
+      85            }`}
+     ...
+       88          </p>
+       89        )}
+       90  
+       69 -      {loadError && <p className={styles.status}>{loadError}</
+          -p>}                                                           
+       91 +      {loadError && (                                         
+       92 +        <p role="alert" className={`${styles.banner} ${styles.
+          +bannerError}`}>                                               
+       93 +          <span>{loadError.message}</span>                    
+       94 +          {loadError.retryable && (                           
+       95 +            <button                                           
+       96 +              type="button"                                   
+       97 +              className={styles.retryButton}                  
+       98 +              onClick={handleRetry}                           
+       99 +              disabled={isRetrying}                           
+      100 +            >                                                 
+      101 +              {isRetrying ? 'Tentando…' : 'Tentar novamente'} 
+      102 +            </button>                                         
+      103 +          )}                                                  
+      104 +        </p>                                                  
+      105 +      )}                                                      
+      106        {!products && !loadError && (
+      107          <p className={styles.status}>Carregando produtos…</p>
+      108        )}
+
+● Update(apps\web\src\App.tsx)
+  ⎿  Added 9 lines, removed 14 lines
+      1 -import { useCallback, useEffect, useState } from 'react';       
+      1 +import { useCallback, useEffect, useRef, useState } from 'react'
+        +;                                                               
+      2  import { getProducts, ApiError } from './api/client';
+      3  import type { CheckoutResult, Product } from './api/schemas';
+      4  import { ProductCard } from './components/ProductCard';
+     ...
+      12    const [loadError, setLoadError] = useState<LoadError | null>(
+          null);
+      13    const [isRetrying, setIsRetrying] = useState(false);
+      14    const [banner, setBanner] = useState<Banner | null>(null);
+      15 +  const cancelledRef = useRef(false);                          
+      16  
+      17    const loadProducts = useCallback(async () => {
+      17 -    let cancelled = false;                                     
+      18 -                                                               
+      18      try {
+      19        const data = await getProducts();
+      21 -      if (!cancelled) {                                        
+      20 +      if (!cancelledRef.current) {                             
+      21          setProducts(data);
+      22          setLoadError(null);
+      23        }
+      24      } catch (error: unknown) {
+      26 -      if (cancelled) return;                                   
+      25 +      if (cancelledRef.current) return;                        
+      26        setLoadError(
+      27          error instanceof ApiError
+      28            ? { message: error.message, retryable: error.retryabl
+          e }
+      29            : { message: 'Não foi possível carregar os produtos.'
+          , retryable: true },
+      30        );
+      31      }
+      33 -                                                               
+      34 -    return () => {                                             
+      35 -      cancelled = true;                                        
+      36 -    };                                                         
+      32    }, []);
+      33  
+      34    useEffect(() => {
+      40 -    let cleanup: (() => void) | undefined;                     
+      41 -    loadProducts().then((fn) => {                              
+      42 -      cleanup = fn;                                            
+      43 -    });                                                        
+      44 -    return () => cleanup?.();                                  
+      35 +    cancelledRef.current = false;                              
+      36 +    loadProducts();                                            
+      37 +    return () => {                                             
+      38 +      cancelledRef.current = true;                             
+      39 +    };                                                         
+      40    }, [loadProducts]);
+      41  
+      42    async function handleRetry() {
+
+● Now let's set up the web test infra. First vitest.config.ts for web:
+
+● Write(apps\web\vitest.config.ts)
+  ⎿  Wrote 12 lines to apps\web\vitest.config.ts
+       1 import { defineConfig } from 'vitest/config';
+       2 
+       3 // Config própria (não estende vite.config.ts): o vite.config.ts
+       4 // API_URL e monta o proxy de dev, nenhum dos dois é relevante p
+         ara os
+       5 // testes unitários do client.ts, que só usa fetch.
+       6 export default defineConfig({
+       8     environment: 'node',
+       9     globals: true,
+      10     include: ['src/**/*.test.ts'],
+     … +4 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(apps\web\package.json)  ⎿  Added 2 lines, removed 1 line
+       7      "dev": "vite",
+       8      "build": "tsc -b && vite build",
+       9      "lint": "oxlint",
+      10 -    "preview": "vite preview"                                  
+      10 +    "preview": "vite preview",                                 
+      11 +    "test": "vitest run"                                       
+      12    },
+      13    "dependencies": {
+      14      "react": "^19.2.8",
+
+● Update(apps\web\package.json)
+  ⎿  Added 2 lines, removed 1 line
+      22      "@vitejs/plugin-react": "^6.1.1",
+      23      "oxlint": "^1.81.0",
+      24      "typescript": "~6.0.2",
+      25 -    "vite": "^8.3.0"                                           
+      25 +    "vite": "^8.3.0",                                          
+      26 +    "vitest": "^4.1.2"                                         
+      27    }
+      28  }
+
+● Now let's update root package.json scripts:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(package.json)
+  ⎿  Added 2 lines, removed 1 line
+       8      "build": "pnpm -r build",
+       9      "build:api": "pnpm --filter @casecellshop/api build",
+      10      "build:web": "pnpm --filter @casecellshop/web build",
+      11 -    "test": "pnpm --filter @casecellshop/api test",            
+      11 +    "test": "pnpm -r test",                                    
+      12      "test:api": "pnpm --filter @casecellshop/api test",
+      13      "test:api:e2e": "pnpm --filter @casecellshop/api test:e2e",
+      14 +    "test:web": "pnpm --filter @casecellshop/web test",        
+      15      "lint": "pnpm -r lint"
+      16    }
+      17  }
+
+● Now let's install vitest for the web package and write the test file.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Good, that peer dependency warning is pre-existing (unrelated to our change).
+  Now write the test file:
+
+● Write(apps\web\src\api\client.test.ts)
+  ⎿  Wrote 216 lines to apps\web\src\api\client.test.ts
+      1 import { describe, it, expect, vi, beforeEach, afterEach } from '
+        vitest';
+      2 import { ApiError, getProducts, postCheckout } from './client';
+      3 
+      4 function jsonResponse(status: number, body: unknown): Response {
+      5   return new Response(JSON.stringify(body), {
+      6     status,
+      7     headers: { 'Content-Type': 'application/json' },
+      8   });
+      9 }
+     … +248 lines (ctrl+o to expand)
+
+● Now let's run the web tests:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 15 tests pass. Now let's build both apps to verify TypeScript compiles
+  cleanly:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(apps\web\src\api\client.test.ts)
+  ⎿  Added 30 lines, removed 20 lines
+      12    return new Response(body, { status, headers: { 'Content-Type'
+          : 'text/plain' } });
+      13  }
+      14  
+      15 +/** Aguarda a promise rejeitar com um ApiError e o devolve tipa
+         +do. */                                                         
+      16 +async function expectApiError(promise: Promise<unknown>): Promi
+         +se<ApiError> {                                                 
+      17 +  try {                                                        
+      18 +    await promise;                                             
+      19 +  } catch (error) {                                            
+      20 +    expect(error).toBeInstanceOf(ApiError);                    
+      21 +    return error as ApiError;                                  
+      22 +  }                                                            
+      23 +  throw new Error('esperava que a chamada rejeitasse com ApiErr
+         +or');                                                          
+      24 +}                                                              
+      25 +                                                               
+      26  const validProduct = {
+      27    id: 'case-iphone-15-silicone',
+      28    name: 'Capa iPhone 15 Silicone',
+     ...
+      69        const jsonSpy = vi.spyOn(response, 'json');
+      70        vi.mocked(fetch).mockResolvedValue(response);
+      71  
+      61 -      const error = await getProducts().catch((e: unknown) => e
+         - as ApiError);                                                 
+      72 +      const error = await expectApiError(getProducts());       
+      73  
+      63 -      expect(error).toBeInstanceOf(ApiError);                  
+      74        expect(error.kind).toBe('unavailable');
+      75        expect(error.status).toBe(status);
+      76        expect(error.retryable).toBe(true);
+     ...
+      84    it('outros 5xx viram mensagem genérica de servidor e são retr
+          yable', async () => {
+      85      vi.mocked(fetch).mockResolvedValue(textResponse(500, 'inter
+          nal error'));
+      86  
+      77 -    const error = await getProducts().catch((e: unknown) => e a
+         -s ApiError);                                                   
+      87 +    const error = await expectApiError(getProducts());         
+      88  
+      79 -    expect(error).toBeInstanceOf(ApiError);                    
+      89      expect(error.kind).toBe('http');
+      90      expect(error.status).toBe(500);
+      91      expect(error.retryable).toBe(true);
+     ...
+       97    it('falha de rede (fetch rejeita) vira mensagem de conexão',
+            async () => {
+       98      vi.mocked(fetch).mockRejectedValue(new TypeError('fetch fa
+           iled'));
+       99  
+       91 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      100 +    const error = await expectApiError(getProducts());        
+      101  
+       93 -    expect(error).toBeInstanceOf(ApiError);                   
+      102      expect(error.kind).toBe('network');
+      103      expect(error.retryable).toBe(true);
+      104      expect(error.message).toBe(
+     ...
+      108    });
+      109  
+      110    it('timeout do cliente (AbortSignal.timeout) vira mensagem d
+           e timeout', async () => {
+      103 -    vi.mocked(fetch).mockRejectedValue(new DOMException('The o
+          -peration timed out.', 'TimeoutError'));                       
+      111 +    vi.mocked(fetch).mockRejectedValue(                       
+      112 +      new DOMException('The operation timed out.', 'TimeoutErr
+          +or'),                                                         
+      113 +    );                                                        
+      114  
+      105 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      115 +    const error = await expectApiError(getProducts());        
+      116  
+      107 -    expect(error).toBeInstanceOf(ApiError);                   
+      117      expect(error.kind).toBe('timeout');
+      118      expect(error.retryable).toBe(true);
+      119      expect(error.message).toBe('O servidor demorou para respon
+           der. Tente novamente.');
+     ...
+      122    it('payload 200 fora do schema vira invalid-response', async
+            () => {
+      123      vi.mocked(fetch).mockResolvedValue(jsonResponse(200, [{ id
+           : 'sem-os-outros-campos' }]));
+      124  
+      116 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      125 +    const error = await expectApiError(getProducts());        
+      126  
+      118 -    expect(error).toBeInstanceOf(ApiError);                   
+      127      expect(error.kind).toBe('invalid-response');
+      128      expect(error.retryable).toBe(false);
+      129      expect(error.message).toBe('Recebemos uma resposta inesper
+           ada do servidor.');
+     ...
+      132    it('corpo 200 não-JSON vira invalid-response', async () => {
+      133      vi.mocked(fetch).mockResolvedValue(textResponse(200, 'não 
+           é json'));
+      134  
+      127 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      135 +    const error = await expectApiError(getProducts());        
+      136  
+      129 -    expect(error).toBeInstanceOf(ApiError);                   
+      137      expect(error.kind).toBe('invalid-response');
+      138    });
+      139  
+      140    it('404 preserva a mensagem do back e não é retryable', asyn
+           c () => {
+      141      vi.mocked(fetch).mockResolvedValue(
+      135 -      jsonResponse(404, { statusCode: 404, message: 'Produto "
+          -x" não encontrado', error: 'Not Found' }),                    
+      142 +      jsonResponse(404, {                                     
+      143 +        statusCode: 404,                                      
+      144 +        message: 'Produto "x" não encontrado',                
+      145 +        error: 'Not Found',                                   
+      146 +      }),                                                     
+      147      );
+      148  
+      138 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      149 +    const error = await expectApiError(getProducts());        
+      150  
+      140 -    expect(error).toBeInstanceOf(ApiError);                   
+      151      expect(error.kind).toBe('http');
+      152      expect(error.status).toBe(404);
+      153      expect(error.retryable).toBe(false);
+     ...
+      163        }),
+      164      );
+      165  
+      156 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      166 +    const error = await expectApiError(getProducts());        
+      167  
+      168      expect(error.status).toBe(409);
+      169      expect(error.retryable).toBe(false);
+     ...
+      178        }),
+      179      );
+      180  
+      171 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      181 +    const error = await expectApiError(getProducts());        
+      182  
+      183      expect(error.status).toBe(400);
+      184      expect(error.message).toBe('Dados inválidos');
+     ...
+      192        jsonResponse(400, { statusCode: 400, message: ['campo ob
+           rigatório'], error: 'Bad Request' }),
+      193      );
+      194  
+      185 -    const error = await getProducts().catch((e: unknown) => e 
+          -as ApiError);                                                 
+      195 +    const error = await expectApiError(getProducts());        
+      196  
+      197      expect(error.message).toBe('campo obrigatório');
+      198    });
+     ...
+      218    it('503 vira mensagem de instabilidade', async () => {
+      219      vi.mocked(fetch).mockResolvedValue(textResponse(503, ''));
+      220  
+      211 -    const error = await postCheckout(validProduct.id, 1).catch
+          -((e: unknown) => e as ApiError);                              
+      221 +    const error = await expectApiError(postCheckout(validProdu
+          +ct.id, 1));                                                   
+      222  
+      223      expect(error.kind).toBe('unavailable');
+      224      expect(error.retryable).toBe(true);
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Tests pass and build succeeds. Now let's lint both apps:
+
+  Read 1 file, ran 3 shell commands (ctrl+o to expand)
+
+● Update(apps\web\src\App.tsx)
+  ⎿  Added 1 line, removed 1 line
+      33  
+      34    useEffect(() => {
+      35      cancelledRef.current = false;
+      36 -    loadProducts();                                            
+      36 +    void loadProducts();                                       
+      37      return () => {
+      38        cancelledRef.current = true;
+      39      };
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Warning-only, doesn't fail the build/lint step — this is a known
+  false-positive for the fetch-on-mount pattern. Let's run the full verification
+  suite from root.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● All 41 tests pass. Now let's run the API e2e tests and lint from root too:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All clean (only the expected pre-existing-pattern warning, no errors). Now
+  let's do a real end-to-end verification: start both servers, kill the API, and
+  confirm the proxy returns a proper 502 JSON.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Exactly as designed — 502 with a clean JSON body. Now let's start the API too
+  and verify the happy path still works, then verify the retry flow closes the
+  loop.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● API is still compiling (watch mode takes a moment). Let's wait and retry.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● API and proxy both work normally with the API up. Now let's do the visual
+  browser check of the retry flow.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● API is down now. Let's open the web page in the browser.
+
+  Called claude-in-chrome 3 times (ctrl+o to expand)
+
+● Exactly the expected banner and retry button, matching the plan. Let's verify
+  the network request status, restart the API, and click "Tentar novamente".
+
+  Called claude-in-chrome (ctrl+o to expand)
+● Now let's restart the API in the background and then click retry.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● API is back up. Now click "Tentar novamente" in the browser.
+
+  Called claude-in-chrome 2 times (ctrl+o to expand)
+
+● "Tentar novamente" recovered the grid without a page reload. Now let's test a
+  checkout error (business rule regression — buy above stock) and then simulate
+  API down during checkout.
+
+  Called claude-in-chrome 4 times (ctrl+o to expand)
+
+● Client-side field validation still works correctly (unaffected by our
+  changes). Now let's test a valid purchase, then simulate killing the API
+  mid-checkout to verify the checkout error path shows the friendly message.
+
+  Read 1 file, called claude-in-chrome 2 times, ran 1 shell command (ctrl+o to expand)
+
+● Confirmed PID 30384. Let's kill it, then click "Comprar".
+
+  Called claude-in-chrome 2 times, ran 1 shell command (ctrl+o to expand)
+
+● The checkout error banner also now shows the friendly message instead of "Erro
+  inesperado (HTTP 502)", and the button correctly reverted to "Comprar". Full
+  regression verified end-to-end. Let's clean up.
+
+  Called claude-in-chrome, ran 7 shell commands (ctrl+o to expand)
+
+● All dev servers cleanly stopped. Let's confirm .env is intact and do one final
+  full test/build/lint pass to be sure nothing regressed from the process
+  cleanup.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Everything is green. Work is complete and verified end-to-end (unit tests, e2e
+  tests, builds, lints, and manual browser testing of both scenarios). Let me
+  summarize what was done.
+
+  Resumo
+
+  API — apps/api/src/main.ts + novo apps/api/src/config/env.ts
+  - bootstrap() agora valida o .env (com Zod) antes de criar a aplicação Nest,
+    com early return em caso de falha.
+  - .env ausente → mensagem em pt-BR citando o caminho absoluto e sugerindo cp 
+    .env.example .env, sem stack trace, process.exitCode = 1.
+  - PORT inválido (não numérico, 0, fracionário, fora de 1–65535) → mensagem
+    apontando exatamente a variável.
+  - EADDRINUSE também vira mensagem amigável.
+  - Testado manualmente: .env ausente, PORT=abc, e boot normal — todos com o
+    comportamento esperado.
+
+  Web — proxy do Vite (apps/web/vite.config.ts)
+  - API_URL ausente/inválida agora falha a config com mensagem clara (antes
+    quebrava com erro interno do Vite).
+  - Handler de erro no proxy: API fora do ar → 502 JSON; timeout/reset → 504
+    JSON (antes: 502 text/plain vazio).
+
+  Web — apps/web/src/api/client.ts (reescrito)
+  - ApiError ganhou kind, status, issues e retryable.
+  - 502/503/504 → mensagem de instabilidade sem tentar ler o corpo; outros 5xx →
+    mensagem genérica de servidor; falha de rede/timeout tratadas
+    explicitamente (antes vazavam como TypeError/ZodError cru); 4xx preserva a
+    mensagem do back e agora também lê issues e message em formato array (Nest
+    default).
+
+  Web — UI (App.tsx/App.module.css)
+  - Botão "Tentar novamente" quando o erro de carregamento é retryable; banners
+    com role="alert".
+
+  Testes
+  - API: env.spec.ts (6 testes novos). Web: Vitest configurado do zero +
+    client.test.ts (15 testes cobrindo todos os cenários do plano).
+  - Total: 26 testes API (unit) + 5 (e2e) + 15 web = 46 testes, todos passando.
+    Builds e lints limpos nos dois apps (só um warning pré-existente de
+    heurística do oxlint em App.tsx, sem impacto — não falha o lint).
+
+  Nada foi commitado — as mudanças estão só no working tree, como nas conversas
+  anteriores deste projeto. Quer que eu faça o commit?
+
+✻ Sautéed for 15m 29s · done 8:17
+
+※ recap: Implemented friendly error handling for missing/invalid .env in the API and for server-unavailable errors (502/503/504) in the web app, with tests and manual verification all passing. Nothing's committed yet — waiting on your go-ahead to commit. (disable recaps in /config)
+
+> /context 
+  ⎿  Context Usage
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛀ ⛁ ⛀ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   Sonnet 5
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   claude-sonnet-5
+     ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   207.6k/1m tokens (21%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ 
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 4.7k tokens (0.5%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 23k tokens (2.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP tools: 3.8k tokens (0.4%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 1k tokens (0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Skills: 10k tokens (1.0%)
+                                               ⛁ Messages: 165.1k tokens (16.5%)
+                                               ⛶ Free space: 759.4k (75.9%)
+                                               ⛝ Autocompact buffer: 33k tokens (3.3%)
+
+     Auto-compact window: 1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 258 tools · 3.8k tokens
+
+     Custom agents · .claude/agents/
+     └ 12 agents · 1k tokens
+
+     Skills · /skills
+     └ 120 skills · 10k tokens
+
+     /context all to expand
